@@ -3,6 +3,7 @@ import asyncio
 import pytest
 import torch
 
+from conftest import hf_logits
 from miniserve.bench.harness import run_workload
 from miniserve.bench.workload import LengthSpec, WorkloadSpec
 from miniserve.engines.prefix_cached import PrefixCachedEngine
@@ -11,19 +12,6 @@ from miniserve.prefix_cache import PrefixCachedGPT2Core
 from miniserve.request import GenerationRequest
 
 
-@pytest.fixture(scope="module")
-def tiny():
-    from transformers import GPT2Config, GPT2LMHeadModel
-
-    torch.manual_seed(0)
-    cfg = GPT2Config(vocab_size=97, n_positions=64, n_embd=32, n_layer=2, n_head=4,
-                     bos_token_id=96, eos_token_id=96)
-    return GPT2LMHeadModel(cfg).eval()
-
-
-def hf_logits(model, ids):
-    with torch.inference_mode():
-        return model(torch.tensor([ids])).logits[0]
 
 
 PREFIX = list(range(1, 13))          # 12 tokens = 3 full blocks of 4
@@ -124,14 +112,10 @@ def _spec(prefix, **over):
     return WorkloadSpec(**base)
 
 
-@pytest.mark.model
-def test_engine_outputs_match_without_caching_on_a_shared_prefix_workload(tiny):
+def test_engine_outputs_match_without_caching_on_a_shared_prefix_workload(tiny_runner):
     from miniserve.engines.paged import PagedEngine
 
-    runner = HFModelRunner.__new__(HFModelRunner)
-    # Hand-build a runner around the tiny model so the real cores run in the engine.
-    runner.model, runner.config, runner.name, runner.device = tiny, tiny.config, "tiny", "cpu"
-    runner.eos_token_id, runner.vocab_size, runner.dtype = tiny.config.eos_token_id, 97, torch.float32
+    runner = tiny_runner
     spec = _spec(prefix=16)
     _, plain = asyncio.run(run_workload(PagedEngine(runner, kv_budget_tokens=256, block_size=4, max_seq_len=64),
                                         spec, warmup=False))

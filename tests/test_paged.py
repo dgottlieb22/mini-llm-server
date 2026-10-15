@@ -3,6 +3,7 @@ import asyncio
 import pytest
 import torch
 
+from conftest import hf_logits
 from miniserve.bench.harness import run_workload
 from miniserve.bench.workload import LengthSpec, WorkloadSpec
 from miniserve.engines.continuous import ContinuousBatchEngine
@@ -36,19 +37,6 @@ def test_block_table_addressing():
 
 # ---- paged core against HF ---------------------------------------------------
 
-@pytest.fixture(scope="module")
-def tiny():
-    from transformers import GPT2Config, GPT2LMHeadModel
-
-    torch.manual_seed(0)
-    cfg = GPT2Config(vocab_size=97, n_positions=64, n_embd=32, n_layer=2, n_head=4,
-                     bos_token_id=96, eos_token_id=96)
-    return GPT2LMHeadModel(cfg).eval()
-
-
-def hf_logits(model, ids):
-    with torch.inference_mode():
-        return model(torch.tensor([ids])).logits[0]
 
 
 def test_paged_core_matches_hf_across_block_boundaries(tiny):

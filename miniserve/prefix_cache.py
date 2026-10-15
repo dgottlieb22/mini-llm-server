@@ -96,32 +96,56 @@ class PrefixCachedGPT2Core(PagedGPT2Core):
             self.evictions += 1
         return True
 
-    def _evictable(self) -> int:
-        return sum(1 for b in self.index.values() if self.refcount.get(b, 0) == 1)
+    def _evictable(self, protect: Sequence[int] = ()) -> int:
+        p = set(protect)
+        return sum(1 for b in self.index.values() if self.refcount.get(b, 0) == 1 and b not in p)
+
+    def _pin(self, hit: Sequence[int]) -> None:
+        for b in hit:
+            self.refcount[b] += 1
+            self.index.move_to_end(self.block_hash[b])  # recently used
+
+    def _unpin(self, hit: Sequence[int]) -> None:
+        for b in hit:
+            self.refcount[b] -= 1
+
+    def _reserve(self, token_ids: Sequence[int], extra_tokens: int) -> Optional[BlockTable]:
+        """Pin the cached prefix, then allocate the rest (evicting if needed).
+
+        The pin comes first: the hit blocks may themselves be unreferenced
+        cache entries, and eviction must not take them out from under the
+        request that is about to use them.
+        """
+        hit, cached = self._lookup(token_ids)
+        need = self.allocator.blocks_needed(len(token_ids) + extra_tokens) - len(hit)
+        self._pin(hit)
+        if not self._free_after_eviction(need):
+            self._unpin(hit)
+            return None
+        table = BlockTable(hit + self.allocator.allocate(need), self.block_size)
+        table.cached_tokens = cached  # type: ignore[attr-defined]
+        self.cache_hits_blocks += len(hit)
+        self.cache_miss_blocks += len(self._prefix_hashes(token_ids)) - len(hit)
+        return table
 
     def blocks_needed_for(self, token_ids: Sequence[int], max_new_tokens: int) -> int:
         _, cached = self._lookup(token_ids)
         return self.allocator.blocks_needed(len(token_ids) + max_new_tokens) - cached // self.block_size
 
+    def _available_for(self, token_ids: Sequence[int]) -> int:
+        """Free blocks plus evictable ones, not counting this prompt's own hits."""
+        hit, _ = self._lookup(token_ids)
+        return self.allocator.num_free + self._evictable(protect=hit)
+
     def can_admit_prompt(self, token_ids: Sequence[int], max_new_tokens: int) -> bool:
         if not self.fits(len(token_ids), max_new_tokens):
             return False
-        need = self.blocks_needed_for(token_ids, max_new_tokens)
-        return need <= self.allocator.num_free + self._evictable()
+        return self.blocks_needed_for(token_ids, max_new_tokens) <= self._available_for(token_ids)
 
     def admit_prompt(self, token_ids: Sequence[int], max_new_tokens: int) -> BlockTable:
-        hit, cached = self._lookup(token_ids)
-        need = self.allocator.blocks_needed(len(token_ids) + max_new_tokens) - len(hit)
-        if not self._free_after_eviction(need):
+        table = self._reserve(token_ids, max_new_tokens)
+        if table is None:
             raise RuntimeError("admit_prompt() called without can_admit_prompt()")
-        for b in hit:
-            self.refcount[b] += 1
-            self.index.move_to_end(self.block_hash[b])  # recently used
-        fresh = self.allocator.allocate(need)
-        table = BlockTable(hit + fresh, self.block_size)
-        table.cached_tokens = cached  # type: ignore[attr-defined]
-        self.cache_hits_blocks += len(hit)
-        self.cache_miss_blocks += len(self._prefix_hashes(token_ids)) - len(hit)
         return table
 
     def free(self, handle: BlockTable) -> None:
@@ -156,6 +180,24 @@ class PrefixCachedGPT2Core(PagedGPT2Core):
                 del self.refcount[b]
                 del self.block_hash[b]
                 self.allocator.free([b])
+
+    def admit_prompt_only(self, token_ids: Sequence[int]) -> Optional[BlockTable]:
+        """Optimistic admission (stage 7): prompt + one position, cache hits taken."""
+        return self._reserve(token_ids, 1)
+
+    def can_admit_prompt_only(self, token_ids: Sequence[int], reserve_blocks: int = 0) -> bool:
+        return self.blocks_needed_for(token_ids, 1) + reserve_blocks <= self._available_for(token_ids)
+
+    def grow(self, handle: BlockTable) -> bool:
+        """Append one block, evicting an unreferenced cached block if the pool is empty."""
+        if not self._free_after_eviction(1):
+            return False
+        handle.blocks.extend(self.allocator.allocate(1))
+        return True
+
+    @property
+    def free_blocks(self) -> int:
+        return self.allocator.num_free + self._evictable()
 
     def _register(self, handle: BlockTable, token_ids: Sequence[int]) -> None:
         """After a prefill, index this prompt's newly computed full blocks."""

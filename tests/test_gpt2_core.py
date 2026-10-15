@@ -1,23 +1,10 @@
 import pytest
 import torch
 
+from conftest import hf_logits
 from miniserve.gpt2 import GPT2Core, argmax_tokens
 
 
-@pytest.fixture(scope="module")
-def tiny():
-    from transformers import GPT2Config, GPT2LMHeadModel
-
-    torch.manual_seed(0)
-    cfg = GPT2Config(vocab_size=97, n_positions=64, n_embd=32, n_layer=2, n_head=4,
-                     bos_token_id=96, eos_token_id=96)
-    model = GPT2LMHeadModel(cfg).eval()
-    return model
-
-
-def hf_logits(model, ids):
-    with torch.inference_mode():
-        return model(torch.tensor([ids])).logits[0]  # [T, vocab]
 
 
 def test_prefill_matches_hf_last_position(tiny):

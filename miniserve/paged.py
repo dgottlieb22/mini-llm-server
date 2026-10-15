@@ -166,6 +166,30 @@ class PagedGPT2Core(GPT2Core):
     def allocated_tokens(self, handles: Sequence[BlockTable]) -> int:
         return sum(h.capacity for h in handles)
 
+    # ---- optimistic (grow-as-you-go) allocation, stage 7 ------------------
+
+    def admit_prompt_only(self, prompt_len: int) -> Optional[BlockTable]:
+        """Reserve blocks for the prompt plus one decode position, or None if the pool cannot."""
+        n = self.allocator.blocks_needed(prompt_len + 1)
+        if n > self.allocator.num_free:
+            return None
+        return BlockTable(self.allocator.allocate(n), self.block_size)
+
+    def needs_block(self, handle: BlockTable, next_position: int) -> bool:
+        """Will writing a token at next_position overflow the table?"""
+        return next_position >= handle.capacity
+
+    def grow(self, handle: BlockTable) -> bool:
+        """Append one block; False if the pool is empty."""
+        if self.allocator.num_free < 1:
+            return False
+        handle.blocks.extend(self.allocator.allocate(1))
+        return True
+
+    @property
+    def free_blocks(self) -> int:
+        return self.allocator.num_free
+
     @property
     def cache_bytes(self) -> int:
         return 2 * self.k_cache.numel() * self.k_cache.element_size()

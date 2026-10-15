@@ -3,6 +3,7 @@ from .async_serial import AsyncSerialEngine
 from .continuous import ContinuousBatchEngine
 from .naive import NaiveEngine
 from .paged import PagedEngine
+from .preempting import PreemptingEngine
 from .prefix_cached import PrefixCachedEngine
 from .static_batch import StaticBatchEngine
 
@@ -13,7 +14,8 @@ ENGINES = {
     ContinuousBatchEngine.name: ContinuousBatchEngine,
     PagedEngine.name: PagedEngine,
     PrefixCachedEngine.name: PrefixCachedEngine,
+    PreemptingEngine.name: PreemptingEngine,
 }
 
 __all__ = ["ENGINES", "NaiveEngine", "AsyncSerialEngine", "StaticBatchEngine", "ContinuousBatchEngine",
-           "PagedEngine", "PrefixCachedEngine"]
+           "PagedEngine", "PrefixCachedEngine", "PreemptingEngine"]

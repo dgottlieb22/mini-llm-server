@@ -204,6 +204,7 @@ class ContinuousBatchEngine:
                 if fut.cancelled():
                     self._pending.popleft()
                     self._cancelled += 1
+                    self._dropped_while_queued(request)
                     continue
                 if not self.core.fits(request.prompt_len, request.max_new_tokens):
                     self._pending.popleft()
@@ -239,6 +240,10 @@ class ContinuousBatchEngine:
     def _fits_prefill_batch(self, group, request: GenerationRequest) -> bool:
         longest = max(request.prompt_len, max(r.prompt_len for r, _, _ in group))
         return (len(group) + 1) * longest <= self.prefill_batch_tokens
+
+    def _dropped_while_queued(self, request: GenerationRequest) -> None:
+        """A queued request was cancelled before admission. Subclasses that keep
+        per-request state outside _running release it here."""
 
     async def _prefill_group(self, loop, group) -> None:
         assert self._executor is not None
