@@ -20,6 +20,7 @@ result file or a probe whose raw output is committed next to it.
 | 1 | `async_serial` | async intake + FIFO queue; model still serial on a worker thread. Predicted and measured: no change | [notes/stage1.md](notes/stage1.md) |
 | 2 | `static_batch` | take up to B queued requests, pad, one `generate()` per batch. 11x throughput on offline/closed-loop; 42% of decode slots wasted on heterogeneous lengths | [notes/stage2.md](notes/stage2.md) |
 | 3 | `continuous` | our own GPT-2 forward over an explicit slot KV cache; admit and retire sequences at every decode step. Queue wait on hetero_hi 3.0 s to 8 ms; KV reservation 70-93% empty at peak | [notes/stage3.md](notes/stage3.md) |
+| 4 | `paged` | block allocator + block tables, gather per step. Same 8192-token budget holds 2-4x the sequences: 12.0 vs 6.1 req/s offline, uniform_8x TTFT p99 2.3 s to 114 ms; loses on long contexts, where the gather doubles KV traffic | [notes/stage4.md](notes/stage4.md) |
 
 Everything so far ran on a CPU-only host (AMD EPYC 9R14, 64 cores) with
 GPT-2 small in fp32. GPU utilization and GPU memory are recorded as "not
@@ -34,12 +35,14 @@ miniserve/
   request.py            GenerationRequest / GenerationResult / RequestRecord
   model.py              HFModelRunner (generate() + per-token timestamps), FakeModelRunner
   gpt2.py               our own GPT-2 forward over a slot-indexed KV cache (stage 3+)
+  paged.py              block allocator, block tables, paged GPT-2 core (stage 4+)
   engines/
     base.py             the Engine interface every stage implements
     naive.py            stage 0
     async_serial.py     stage 1
     static_batch.py     stage 2
     continuous.py       stage 3
+    paged.py            stage 4
   bench/
     workload.py         WorkloadSpec, length distributions, arrival processes, presets
     harness.py          asyncio load generator; replays a workload against any engine (with warm-up)
@@ -80,12 +83,15 @@ All presets use 32 requests, random token ids, forced output length, seed 0.
 | burst | 4 bursts of 8, 20 s apart | 128 | 64 |
 | uniform_hi | Poisson 3 req/s | 128 | 64 |
 | hetero_hi | Poisson 1 req/s | U[16, 512] | U[8, 256] |
+| uniform_8x | Poisson 8 req/s, 64 requests | 128 | 64 |
+| hetero_4x | Poisson 4 req/s, 64 requests | U[16, 512] | U[8, 256] |
 
 The first five rates were sized to the stage 0 service time (1.91 s for a
 128/64 request on this host) so the baseline runs at about 0.8 utilization.
 The two `_hi` variants were added at stage 2 for the batching engines; the
-serial engine is overloaded on them. Every run warms the engine with one
-dummy batch at the workload's largest shape before the clock starts
+serial engine is overloaded on them. The `_8x`/`_4x` variants were added at
+stage 4 to saturate 8 concurrent sequences. Every run warms the engine with
+one dummy batch at the workload's largest shape before the clock starts
 (`--no-warmup` to measure cold).
 
 ## Metrics
