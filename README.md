@@ -18,6 +18,7 @@ result file or a probe whose raw output is committed next to it.
 |---|---|---|---|
 | 0 | `naive` | one request at a time, whole request to `generate()` | [notes/stage0.md](notes/stage0.md) |
 | 1 | `async_serial` | async intake + FIFO queue; model still serial on a worker thread. Predicted and measured: no change | [notes/stage1.md](notes/stage1.md) |
+| 2 | `static_batch` | take up to B queued requests, pad, one `generate()` per batch. 11x throughput on offline/closed-loop; 42% of decode slots wasted on heterogeneous lengths | [notes/stage2.md](notes/stage2.md) |
 
 Everything so far ran on a CPU-only host (AMD EPYC 9R14, 64 cores) with
 GPT-2 small in fp32. GPU utilization and GPU memory are recorded as "not
@@ -35,12 +36,14 @@ miniserve/
     base.py             the Engine interface every stage implements
     naive.py            stage 0
     async_serial.py     stage 1
+    static_batch.py     stage 2
   bench/
     workload.py         WorkloadSpec, length distributions, arrival processes, presets
-    harness.py          asyncio load generator; replays a workload against any engine
-    metrics.py          TTFT / TPOT / queue wait / throughput definitions
+    harness.py          asyncio load generator; replays a workload against any engine (with warm-up)
+    metrics.py          TTFT / TPOT / queue wait / throughput / occupancy definitions
     run.py              CLI: one engine x one workload -> JSON record
     compare.py          tables across records, head-of-line blocking summary
+    resummarize.py      recompute summaries of old records after a metric change
     envinfo.py          hardware and version capture
 scripts/                probes and calibration used in the notes
 notes/                  one experiment record per stage
@@ -72,9 +75,15 @@ All presets use 32 requests, random token ids, forced output length, seed 0.
 | uniform | Poisson 0.4 req/s | 128 | 64 |
 | hetero | Poisson 0.2 req/s | U[16, 512] | U[8, 256] |
 | burst | 4 bursts of 8, 20 s apart | 128 | 64 |
+| uniform_hi | Poisson 3 req/s | 128 | 64 |
+| hetero_hi | Poisson 1 req/s | U[16, 512] | U[8, 256] |
 
-The rates were sized to the stage 0 service time (1.91 s for a 128/64
-request on this host) so the baseline runs at about 0.8 utilization.
+The first five rates were sized to the stage 0 service time (1.91 s for a
+128/64 request on this host) so the baseline runs at about 0.8 utilization.
+The two `_hi` variants were added at stage 2 for the batching engines; the
+serial engine is overloaded on them. Every run warms the engine with one
+dummy batch at the workload's largest shape before the clock starts
+(`--no-warmup` to measure cold).
 
 ## Metrics
 
