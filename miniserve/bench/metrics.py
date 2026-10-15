@@ -17,12 +17,16 @@ Per run:
   total_tok_per_s  (prompt + generated tokens) / makespan
   busy_fraction    sum of per-request service time / makespan. For a serial
                    engine this is server utilization; for a batching engine
-                   it exceeds 1 and is reported as is.
+                   members overlap and it exceeds 1 when the engine is full.
+  occupancy        fraction of the makespan with at least one request in
+                   service. This is server utilization for any engine.
+  mean_in_service  busy_fraction / occupancy: average number of requests in
+                   service while the engine was busy (1 for a serial engine).
 """
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -88,6 +92,23 @@ def percentiles(values: Sequence[float]) -> Dict[str, float]:
     }
 
 
+def occupancy(intervals: Sequence[Tuple[float, float]], makespan: float) -> float:
+    """Fraction of the makespan during which at least one request was in service."""
+    if not intervals or makespan <= 0:
+        return 0.0
+    covered = 0.0
+    cur_start, cur_end = None, None
+    for s, e in sorted(intervals):
+        if cur_end is None or s > cur_end:
+            if cur_end is not None:
+                covered += cur_end - cur_start
+            cur_start, cur_end = s, e
+        else:
+            cur_end = max(cur_end, e)
+    covered += cur_end - cur_start
+    return covered / makespan
+
+
 def summarize(metrics: Sequence[RequestMetrics], num_submitted: int) -> Dict[str, object]:
     if not metrics:
         return {"completed": 0, "submitted": num_submitted}
@@ -97,6 +118,7 @@ def summarize(metrics: Sequence[RequestMetrics], num_submitted: int) -> Dict[str
     gen_tokens = sum(m.gen_len for m in metrics)
     prompt_tokens = sum(m.prompt_len for m in metrics)
     service_time = sum(m.finish - m.service_start for m in metrics)
+    occ = occupancy([(m.service_start, m.finish) for m in metrics], makespan)
     return {
         "completed": len(metrics),
         "submitted": num_submitted,
@@ -105,6 +127,8 @@ def summarize(metrics: Sequence[RequestMetrics], num_submitted: int) -> Dict[str
         "output_tok_per_s": gen_tokens / makespan,
         "total_tok_per_s": (gen_tokens + prompt_tokens) / makespan,
         "busy_fraction": service_time / makespan,
+        "occupancy": occ,
+        "mean_in_service": (service_time / makespan) / occ if occ > 0 else 0.0,
         "queue_wait_s": percentiles([m.queue_wait for m in metrics]),
         "ttft_s": percentiles([m.ttft for m in metrics]),
         "prefill_latency_s": percentiles([m.prefill_latency for m in metrics]),

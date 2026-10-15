@@ -65,7 +65,7 @@ def test_closed_loop_arrival_is_previous_finish_and_service_is_fifo():
     for r in records:
         assert r.arrival_time == t0 or r.arrival_time in finishes
     # records are sorted by arrival; the engine must have served them in that order
-    assert runner.calls == [r.request.request_id for r in records]
+    assert runner.calls == ["warmup"] + [r.request.request_id for r in records]
 
 
 def test_engine_exception_is_recorded_not_raised():
@@ -76,7 +76,19 @@ def test_engine_exception_is_recorded_not_raised():
             return super().generate_one(request)
 
     spec = _spec(num_requests=4)
-    _, records = asyncio.run(run_workload(NaiveEngine(Boom()), spec))
+    _, records = asyncio.run(run_workload(NaiveEngine(Boom()), spec, warmup=False))
     errors = [r for r in records if r.result.error]
     assert len(errors) == 1 and "bad luck" in errors[0].result.error
     assert sum(1 for r in records if not r.result.error) == 3
+
+
+def test_warmup_runs_before_the_clock_and_is_not_a_record():
+    runner = FakeModelRunner()
+    spec = _spec(num_requests=3)
+    t0, records = asyncio.run(run_workload(NaiveEngine(runner), spec, warmup=True))
+    assert runner.calls[0] == "warmup"
+    assert len(records) == 3 and all(not r.request.request_id.startswith("warmup") for r in records)
+    assert all(r.result.service_start >= t0 for r in records)
+    runner2 = FakeModelRunner()
+    asyncio.run(run_workload(NaiveEngine(runner2), spec, warmup=False))
+    assert "warmup" not in runner2.calls

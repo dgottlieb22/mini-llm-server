@@ -37,6 +37,10 @@ class StaticBatchEngine(AsyncSerialEngine):
         self._prompt_tokens_padded = 0
         self._decode_slots_real = 0
         self._decode_slots_padded = 0
+        self._peak_padded_tokens = 0
+
+    def _warmup_batch_size(self) -> int:
+        return self.max_batch_size
 
     def _take_batch(self, first: _QueueItem) -> List[_QueueItem]:
         assert self._queue is not None
@@ -53,6 +57,8 @@ class StaticBatchEngine(AsyncSerialEngine):
         self._prompt_tokens_padded += max_prompt * len(requests)
         self._decode_slots_real += sum(r.max_new_tokens for r in requests)
         self._decode_slots_padded += max_gen * len(requests)
+        # What the padded batch occupies in the KV cache at its last step.
+        self._peak_padded_tokens = max(self._peak_padded_tokens, len(requests) * (max_prompt + max_gen))
 
     async def _run(self) -> None:
         assert self._queue is not None and self._executor is not None
@@ -90,6 +96,7 @@ class StaticBatchEngine(AsyncSerialEngine):
             prompt_tokens_padded=self._prompt_tokens_padded,
             decode_slots_real=self._decode_slots_real,
             decode_slots_padded=self._decode_slots_padded,
+            peak_padded_tokens=self._peak_padded_tokens,
         )
         if self._prompt_tokens_padded:
             s["prompt_pad_fraction"] = 1 - self._prompt_tokens_real / self._prompt_tokens_padded

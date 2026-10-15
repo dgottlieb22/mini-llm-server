@@ -49,12 +49,22 @@ async def run_workload(
     engine: Engine,
     spec: WorkloadSpec,
     requests: Optional[Sequence[GenerationRequest]] = None,
+    warmup: bool = True,
 ) -> Tuple[float, List[RequestRecord]]:
-    """Returns (t0, records). t0 is the perf_counter() run start."""
+    """Returns (t0, records). t0 is the perf_counter() run start.
+
+    With warmup=True the engine first serves a dummy workload at the largest
+    prompt and output length in the spec, before t0. A fresh process pays
+    page-fault and allocator costs on its first call that a running server
+    never sees again (see results/stage2/probes.md), so the measurement
+    starts from a warm engine.
+    """
     reqs = list(requests) if requests is not None else generate_requests(spec)
     records: List[RequestRecord] = []
     await engine.start()
     try:
+        if warmup:
+            await engine.warmup(max(r.prompt_len for r in reqs), max(r.max_new_tokens for r in reqs))
         t0 = time.perf_counter()
         if spec.open_loop:
             offsets = arrival_offsets(spec)

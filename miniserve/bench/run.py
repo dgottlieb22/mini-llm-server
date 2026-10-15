@@ -58,10 +58,11 @@ def run_once(
     runner,
     tag: Optional[str] = None,
     engine_kwargs: Optional[Dict[str, object]] = None,
+    warmup: bool = True,
 ) -> Dict[str, object]:
     engine_cls = ENGINES[engine_name]
     engine = engine_cls(runner, **(engine_kwargs or {}))
-    t0, records = asyncio.run(run_workload(engine, spec))
+    t0, records = asyncio.run(run_workload(engine, spec, warmup=warmup))
     per_req = metrics.per_request(records, t0)
     summary = metrics.summarize(per_req, num_submitted=len(records))
     errors = [r.result.error for r in records if r.result is not None and r.result.error]
@@ -73,6 +74,7 @@ def run_once(
         "schema": 1,
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "tag": tag,
+        "warmup": warmup,
         "engine": {
             "name": engine.name,
             "stage": engine.stage,
@@ -107,7 +109,7 @@ def summary_text(record: Dict[str, object]) -> str:
         f"workload={w['name']}  completed={s['completed']}/{s['submitted']}",
         f"  makespan {s['makespan_s']:.1f} s   {s['requests_per_s']:.3f} req/s   "
         f"{s['output_tok_per_s']:.1f} out tok/s   {s['total_tok_per_s']:.1f} total tok/s   "
-        f"busy {s['busy_fraction']:.2f}",
+        f"occupancy {s['occupancy']:.2f}   mean in service {s['mean_in_service']:.1f}",
         f"  queue wait  {_fmt_pct(s['queue_wait_s'])}",
         f"  TTFT        {_fmt_pct(s['ttft_s'])}",
         f"  prefill     {_fmt_pct(s['prefill_latency_s'])}",
@@ -134,12 +136,14 @@ def main(argv=None) -> int:
     p.add_argument("--tag", default=None, help="free-form label stored in the record")
     p.add_argument("--engine-kw", action="append", default=[], metavar="KEY=VALUE",
                    help="engine constructor argument, e.g. max_batch_size=8 (repeatable)")
+    p.add_argument("--no-warmup", action="store_true", help="measure from a cold engine")
     args = p.parse_args(argv)
 
     spec = WORKLOADS[args.workload]
     runner = build_runner(args)
     engine_kwargs = parse_engine_kwargs(args.engine_kw)
-    record = run_once(args.engine, spec, runner, tag=args.tag, engine_kwargs=engine_kwargs)
+    record = run_once(args.engine, spec, runner, tag=args.tag, engine_kwargs=engine_kwargs,
+                      warmup=not args.no_warmup)
     os.makedirs(args.out, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     kw = "".join(f"_{k}{v}" for k, v in sorted(engine_kwargs.items()))

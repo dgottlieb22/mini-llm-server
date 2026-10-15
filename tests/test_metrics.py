@@ -53,8 +53,25 @@ def test_summary_throughput_and_busy_fraction():
     assert s["output_tok_per_s"] == pytest.approx(2.0)
     assert s["total_tok_per_s"] == pytest.approx((8 + 4) / 2.0)
     assert s["busy_fraction"] == pytest.approx(1.0)
+    assert s["occupancy"] == pytest.approx(1.0)
+    assert s["mean_in_service"] == pytest.approx(1.0)
     assert s["queue_wait_s"]["p50"] == pytest.approx(0.5)
     assert s["queue_wait_s"]["max"] == pytest.approx(1.0)
+
+
+def test_occupancy_with_overlap_and_gaps():
+    # a and b fully overlap on [0,1]; c runs alone on [3,4]; idle on (1,3).
+    recs = [
+        _rec("a", 0.0, 0.0, [0.5, 1.0], 1.0),
+        _rec("b", 0.0, 0.0, [0.5, 1.0], 1.0),
+        _rec("c", 0.0, 3.0, [3.5, 4.0], 4.0),
+    ]
+    ms = metrics.per_request(recs, 0.0)
+    s = metrics.summarize(ms, num_submitted=3)
+    assert s["busy_fraction"] == pytest.approx(3.0 / 4.0)
+    assert s["occupancy"] == pytest.approx(2.0 / 4.0)
+    assert s["mean_in_service"] == pytest.approx(1.5)
+    assert metrics.occupancy([], 1.0) == 0.0
 
 
 def test_percentiles_shape():

@@ -27,7 +27,8 @@ COLUMNS = [
     ("queue p99", lambda s: _ms(s["queue_wait_s"], "p99")),
     ("e2e p50", lambda s: _sec(s["e2e_latency_s"], "p50")),
     ("e2e p99", lambda s: _sec(s["e2e_latency_s"], "p99")),
-    ("busy", lambda s: f"{s['busy_fraction']:.2f}"),
+    ("busy", lambda s: f"{s['occupancy']:.2f}" if "occupancy" in s else f"{s['busy_fraction']:.2f}"),
+    ("avg batch", lambda s: f"{s['mean_in_service']:.1f}" if "mean_in_service" in s else "n/a"),
     ("peak tok", lambda s: str(s["peak_live_tokens"])),
 ]
 

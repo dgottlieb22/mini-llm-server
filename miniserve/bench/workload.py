@@ -190,4 +190,17 @@ WORKLOADS: Dict[str, WorkloadSpec] = {
         arrival="closed", concurrency=8,
         description="8 closed-loop clients, each with one request in flight.",
     ),
+    # Higher-load variants, added at stage 2: the original rates were sized for
+    # the serial engine and leave a batching engine idle most of the time.
+    # At these rates the stage 0 engine is overloaded (utilization > 1).
+    "uniform_hi": WorkloadSpec(
+        name="uniform_hi", num_requests=32, prompt_len=_fixed(128), gen_len=_fixed(64),
+        arrival="poisson", rate=3.0,
+        description="Homogeneous requests (128 in, 64 out), Poisson arrivals at 3 req/s.",
+    ),
+    "hetero_hi": WorkloadSpec(
+        name="hetero_hi", num_requests=32, prompt_len=_uniform(16, 512), gen_len=_uniform(8, 256),
+        arrival="poisson", rate=1.0,
+        description="Heterogeneous lengths (prompt 16-512, output 8-256), Poisson at 1 req/s.",
+    ),
 }

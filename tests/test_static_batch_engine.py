@@ -23,12 +23,22 @@ def _spec(**over):
 def test_batches_form_from_the_queue_in_fifo_order_up_to_the_cap():
     runner = FakeModelRunner(decode_cost_per_token=0.001)
     spec = _spec(num_requests=10)
-    _, records = asyncio.run(run_workload(StaticBatchEngine(runner, max_batch_size=4), spec))
+    _, records = asyncio.run(run_workload(StaticBatchEngine(runner, max_batch_size=4), spec, warmup=False))
     assert [len(b) for b in runner.batches] == [4, 4, 2]
     flat = [rid for b in runner.batches for rid in b]
     assert flat == [r.request.request_id for r in records]  # FIFO across and within batches
     stats = StaticBatchEngine(runner, max_batch_size=4).stats()
     assert stats["max_batch_size"] == 4
+
+
+def test_warmup_uses_the_full_batch_and_is_not_counted():
+    runner = FakeModelRunner()
+    engine = StaticBatchEngine(runner, max_batch_size=4)
+    spec = _spec(num_requests=2)
+    asyncio.run(run_workload(engine, spec, warmup=True))
+    assert len(runner.batches[0]) == 4 and all(r.startswith("warmup") for r in runner.batches[0])
+    assert engine.stats()["served"] == 2
+    assert engine.stats()["batch_sizes"] == {"2": 1}
 
 
 def test_batch_cap_of_one_degenerates_to_stage_1():
@@ -61,6 +71,7 @@ def test_padding_and_slot_accounting():
     assert s["prompt_pad_fraction"] == pytest.approx(4 / 14)
     assert s["decode_slot_waste_fraction"] == pytest.approx(3 / 10)
     assert s["batch_sizes"] == {"2": 1}
+    assert s["peak_padded_tokens"] == 2 * (7 + 5)
 
 
 async def test_short_member_waits_for_the_longest_member():

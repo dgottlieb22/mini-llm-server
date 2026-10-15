@@ -63,3 +63,12 @@ class RequestRecord:
     arrival_time: float
     result: Optional[GenerationResult] = None
     extra: dict = field(default_factory=dict)
+
+
+def dummy_request(request_id: str, prompt_len: int, gen_len: int, vocab_size: int = 50000) -> GenerationRequest:
+    """A deterministic request of the given shape, for warm-ups."""
+    return GenerationRequest(
+        request_id=request_id,
+        prompt_ids=[(i * 7919 + 17) % vocab_size for i in range(prompt_len)],
+        max_new_tokens=gen_len,
+    )

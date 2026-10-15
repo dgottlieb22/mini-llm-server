@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional, Tuple
 
 from ..model import ModelRunner
-from ..request import GenerationRequest, GenerationResult
+from ..request import GenerationRequest, GenerationResult, dummy_request
 
 _QueueItem = Tuple[GenerationRequest, "asyncio.Future[GenerationResult]"]
 
@@ -54,6 +54,17 @@ class AsyncSerialEngine:
             pass
         self._executor.shutdown(wait=True)
         self._loop_task = None
+
+    async def warmup(self, prompt_len: int, gen_len: int) -> None:
+        """Run one dummy batch at this engine's largest shape on the worker thread."""
+        if self._loop_task is None:
+            await self.start()
+        assert self._executor is not None
+        dummies = [dummy_request(f"warmup-{i}", prompt_len, gen_len) for i in range(self._warmup_batch_size())]
+        await asyncio.get_running_loop().run_in_executor(self._executor, self.runner.generate_batch, dummies)
+
+    def _warmup_batch_size(self) -> int:
+        return 1
 
     async def generate(self, request: GenerationRequest) -> GenerationResult:
         if self._loop_task is None:

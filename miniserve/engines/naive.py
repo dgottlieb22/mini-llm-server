@@ -13,7 +13,7 @@ import asyncio
 from typing import Dict, Optional
 
 from ..model import ModelRunner
-from ..request import GenerationRequest, GenerationResult
+from ..request import GenerationRequest, GenerationResult, dummy_request
 
 
 class NaiveEngine:
@@ -32,6 +32,9 @@ class NaiveEngine:
 
     async def stop(self) -> None:
         pass
+
+    async def warmup(self, prompt_len: int, gen_len: int) -> None:
+        self.runner.generate_one(dummy_request("warmup", prompt_len, gen_len))
 
     async def generate(self, request: GenerationRequest) -> GenerationResult:
         if self._lock is None:
