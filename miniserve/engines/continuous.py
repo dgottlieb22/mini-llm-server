@@ -121,6 +121,30 @@ class ContinuousBatchEngine:
             fut.cancel()  # the loop sees this at the next step boundary and frees the slot
             raise
 
+    # ---- model calls (run on the worker thread) --------------------------
+    #
+    # Both return plain Python ints. The asyncio thread never touches a
+    # tensor: scripts/probe_engine_step.py measured 3 ms per step of
+    # main-thread work when the argmax ran there, on a 16.6 ms decode.
+
+    def _prefill_and_pick(self, slot: int, request: GenerationRequest) -> int:
+        logits = self.core.prefill(slot, request.prompt_ids)
+        return self._pick(logits, [request])[0]
+
+    def _decode_and_pick(self, slots: List[int], tokens: List[int], positions: List[int],
+                         requests: List[GenerationRequest]) -> List[int]:
+        logits = self.core.decode(slots, tokens, positions)
+        return self._pick(logits, requests)
+
+    def _pick(self, logits, requests: List[GenerationRequest]) -> List[int]:
+        """Greedy token per row; EOS is never chosen for forced-length requests."""
+        eos = self.core.eos_token_id
+        forced = [i for i, r in enumerate(requests) if r.force_length]
+        if forced and eos is not None:
+            logits = logits.clone()
+            logits[forced, eos] = -math.inf
+        return argmax_tokens(logits)
+
     # ---- the loop --------------------------------------------------------
 
     async def _run(self) -> None:
@@ -154,7 +178,7 @@ class ContinuousBatchEngine:
             slot = self._free_slots.pop()
             t0 = time.perf_counter()
             try:
-                logits = await loop.run_in_executor(self._executor, self.core.prefill, slot, request.prompt_ids)
+                tok = await loop.run_in_executor(self._executor, self._prefill_and_pick, slot, request)
             except Exception as exc:  # noqa: BLE001 (handed to the caller)
                 self._free_slots.append(slot)
                 if not fut.done():
@@ -164,22 +188,12 @@ class ContinuousBatchEngine:
             self._prefill_count += 1
             self._prefill_time += t1 - t0
             self._prefill_tokens += request.prompt_len
-            tok = self._pick(logits, [request])[0]
             seq = _Seq(request, fut, slot, service_start=t0, output=[tok], token_times=[t1],
                        cache_len=request.prompt_len)
             self._running[slot] = seq
             self._note_kv_usage()
             if seq.done or self._stopped_on_eos(seq, tok):
                 self._finish(seq, t1)
-
-    def _pick(self, logits, requests: List[GenerationRequest]) -> List[int]:
-        """Greedy token per row; EOS is never chosen for forced-length requests."""
-        eos = self.core.eos_token_id
-        forced = [i for i, r in enumerate(requests) if r.force_length]
-        if forced and eos is not None:
-            logits = logits.clone()
-            logits[forced, eos] = -math.inf
-        return argmax_tokens(logits)
 
     def _stopped_on_eos(self, seq: _Seq, tok: int) -> bool:
         return (not seq.request.force_length) and tok == self.core.eos_token_id
@@ -188,7 +202,6 @@ class ContinuousBatchEngine:
         """One decode step over every active slot."""
         assert self._executor is not None
         loop = asyncio.get_running_loop()
-        now = time.perf_counter()
         for slot, seq in list(self._running.items()):
             if seq.fut.cancelled():
                 self._release(seq)
@@ -200,12 +213,13 @@ class ContinuousBatchEngine:
         tokens = [s.output[-1] for s in seqs]
         positions = [s.cache_len for s in seqs]
         t0 = time.perf_counter()
-        logits = await loop.run_in_executor(self._executor, self.core.decode, slots, tokens, positions)
+        picks = await loop.run_in_executor(
+            self._executor, self._decode_and_pick, slots, tokens, positions, [s.request for s in seqs]
+        )
         t1 = time.perf_counter()
         self._decode_steps += 1
         self._decode_time += t1 - t0
         self._active_sum += len(seqs)
-        picks = self._pick(logits, [s.request for s in seqs])
         for seq, tok in zip(seqs, picks):
             seq.cache_len += 1
             seq.output.append(tok)
