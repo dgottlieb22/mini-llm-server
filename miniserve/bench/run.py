@@ -13,7 +13,7 @@ import datetime as dt
 import json
 import os
 import sys
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from ..engines import ENGINES
 from ..model import FakeModelRunner, HFModelRunner
@@ -34,9 +34,33 @@ def build_runner(args: argparse.Namespace):
     )
 
 
-def run_once(engine_name: str, spec: WorkloadSpec, runner, tag: Optional[str] = None) -> Dict[str, object]:
+def parse_engine_kwargs(items: Optional[List[str]]) -> Dict[str, object]:
+    """key=value pairs; values parsed as int, then float, then left as str."""
+    out: Dict[str, object] = {}
+    for item in items or []:
+        if "=" not in item:
+            raise SystemExit(f"--engine-kw expects key=value, got {item!r}")
+        k, v = item.split("=", 1)
+        for cast in (int, float):
+            try:
+                out[k] = cast(v)
+                break
+            except ValueError:
+                continue
+        else:
+            out[k] = v
+    return out
+
+
+def run_once(
+    engine_name: str,
+    spec: WorkloadSpec,
+    runner,
+    tag: Optional[str] = None,
+    engine_kwargs: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
     engine_cls = ENGINES[engine_name]
-    engine = engine_cls(runner)
+    engine = engine_cls(runner, **(engine_kwargs or {}))
     t0, records = asyncio.run(run_workload(engine, spec))
     per_req = metrics.per_request(records, t0)
     summary = metrics.summarize(per_req, num_submitted=len(records))
@@ -49,7 +73,12 @@ def run_once(engine_name: str, spec: WorkloadSpec, runner, tag: Optional[str] = 
         "schema": 1,
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "tag": tag,
-        "engine": {"name": engine.name, "stage": engine.stage, "stats": engine.stats()},
+        "engine": {
+            "name": engine.name,
+            "stage": engine.stage,
+            "kwargs": engine_kwargs or {},
+            "stats": engine.stats(),
+        },
         "model": {
             "name": runner.name,
             "kv_bytes_per_token": runner.kv_bytes_per_token,
@@ -103,14 +132,18 @@ def main(argv=None) -> int:
     p.add_argument("--fake-decode-cost", type=float, default=0.0, help="s/token for --model fake")
     p.add_argument("--out", default="results/raw", help="directory for the JSON record")
     p.add_argument("--tag", default=None, help="free-form label stored in the record")
+    p.add_argument("--engine-kw", action="append", default=[], metavar="KEY=VALUE",
+                   help="engine constructor argument, e.g. max_batch_size=8 (repeatable)")
     args = p.parse_args(argv)
 
     spec = WORKLOADS[args.workload]
     runner = build_runner(args)
-    record = run_once(args.engine, spec, runner, tag=args.tag)
+    engine_kwargs = parse_engine_kwargs(args.engine_kw)
+    record = run_once(args.engine, spec, runner, tag=args.tag, engine_kwargs=engine_kwargs)
     os.makedirs(args.out, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = os.path.join(args.out, f"{args.engine}_{args.workload}_{stamp}.json")
+    kw = "".join(f"_{k}{v}" for k, v in sorted(engine_kwargs.items()))
+    path = os.path.join(args.out, f"{args.engine}{kw}_{args.workload}_{stamp}.json")
     with open(path, "w") as f:
         json.dump(record, f, indent=1)
     print(summary_text(record))

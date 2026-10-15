@@ -52,8 +52,9 @@ def load(paths: Iterable[str]) -> List[dict]:
 
 def label(rec: dict) -> str:
     e = rec["engine"]
+    kw = "".join(f" {k}={v}" for k, v in sorted(e.get("kwargs", {}).items()))
     tag = f" [{rec['tag']}]" if rec.get("tag") else ""
-    return f"stage {e['stage']} {e['name']}{tag}"
+    return f"stage {e['stage']} {e['name']}{kw}{tag}"
 
 
 def table(records: List[dict]) -> str:

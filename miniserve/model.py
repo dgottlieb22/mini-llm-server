@@ -10,7 +10,7 @@ HFModelRunner then becomes the thing that runs one forward pass.
 from __future__ import annotations
 
 import time
-from typing import List, Optional, Protocol
+from typing import List, Optional, Protocol, Sequence
 
 from .request import GenerationRequest, GenerationResult
 
@@ -22,6 +22,8 @@ class ModelRunner(Protocol):
     def kv_bytes_per_token(self) -> int: ...
 
     def generate_one(self, request: GenerationRequest) -> GenerationResult: ...
+
+    def generate_batch(self, requests: Sequence[GenerationRequest]) -> List[GenerationResult]: ...
 
 
 class _TimestampStreamer:
@@ -112,6 +114,74 @@ class HFModelRunner:
             finish_reason=reason,
         )
 
+    def generate_batch(self, requests: Sequence[GenerationRequest]) -> List[GenerationResult]:
+        """Static batching: one generate() over a left-padded batch.
+
+        Prompts are left-padded to the longest prompt; every sequence then
+        decodes in lockstep. A sequence that reaches its own length stops
+        producing real tokens but stays in the batch (HF writes pad tokens
+        for it) until the longest member finishes, and its result is only
+        returned when the whole batch returns. finish_time is therefore the
+        batch end for every member; token_times are the per-step times.
+        """
+        import torch
+        from transformers import LogitsProcessorList, StoppingCriteriaList, SuppressTokensLogitsProcessor
+
+        batch = len(requests)
+        max_prompt = max(r.prompt_len for r in requests)
+        gen_lens = [r.max_new_tokens for r in requests]
+        pad = self.eos_token_id
+        input_ids = torch.full((batch, max_prompt), pad, dtype=torch.long, device=self.device)
+        attention_mask = torch.zeros((batch, max_prompt), dtype=torch.long, device=self.device)
+        for i, r in enumerate(requests):
+            input_ids[i, max_prompt - r.prompt_len:] = torch.tensor(r.prompt_ids, dtype=torch.long)
+            attention_mask[i, max_prompt - r.prompt_len:] = 1
+        streamer = _TimestampStreamer()
+        kwargs = dict(
+            attention_mask=attention_mask,
+            max_new_tokens=max(gen_lens),
+            do_sample=False,
+            pad_token_id=pad,
+            streamer=streamer,
+            stopping_criteria=StoppingCriteriaList([_PerSequenceLength(gen_lens, max_prompt)]),
+        )
+        if all(r.force_length for r in requests):
+            kwargs["logits_processor"] = LogitsProcessorList([SuppressTokensLogitsProcessor([pad])])
+        service_start = time.perf_counter()
+        with torch.inference_mode():
+            out = self.model.generate(input_ids, **kwargs)
+        finish = time.perf_counter()
+        step_times = streamer.times[1:]
+        results = []
+        for i, r in enumerate(requests):
+            n = gen_lens[i]
+            ids = out[i, max_prompt:max_prompt + n].tolist()
+            if len(ids) != n or len(step_times) < n:
+                raise RuntimeError(f"{r.request_id}: got {len(ids)} tokens / {len(step_times)} steps for {n}")
+            results.append(
+                GenerationResult(
+                    request_id=r.request_id,
+                    output_ids=ids,
+                    service_start=service_start,
+                    token_times=step_times[:n],
+                    finish_time=finish,
+                    finish_reason="length",
+                )
+            )
+        return results
+
+
+class _PerSequenceLength:
+    """StoppingCriteria: sequence i is done once it has produced gen_lens[i] tokens."""
+
+    def __init__(self, gen_lens: Sequence[int], prompt_len: int) -> None:
+        import torch
+
+        self.targets = torch.tensor([prompt_len + g for g in gen_lens])
+
+    def __call__(self, input_ids, scores, **kwargs):  # noqa: ANN001
+        return input_ids.shape[1] >= self.targets.to(input_ids.device)
+
 
 class FakeModelRunner:
     """Deterministic stand-in for tests: no weights, optional simulated cost.
@@ -136,6 +206,7 @@ class FakeModelRunner:
         self.decode_cost_per_token = decode_cost_per_token
         self._kv_bytes_per_token = kv_bytes_per_token
         self.calls: List[str] = []
+        self.batches: List[List[str]] = []
 
     @property
     def kv_bytes_per_token(self) -> int:
@@ -165,3 +236,36 @@ class FakeModelRunner:
             finish_time=time.perf_counter(),
             finish_reason="length",
         )
+
+    def generate_batch(self, requests: Sequence[GenerationRequest]) -> List[GenerationResult]:
+        """Lockstep decode like the HF batch: the batch runs to its longest
+        member; one step costs decode_cost_per_token regardless of batch size
+        (the idealized 'batching is free' model). Padded prompt positions
+        cost prefill time like real ones."""
+        self.calls.append("+".join(r.request_id for r in requests))
+        self.batches.append([r.request_id for r in requests])
+        service_start = time.perf_counter()
+        max_prompt = max(r.prompt_len for r in requests)
+        if self.prefill_cost_per_token:
+            time.sleep(self.prefill_cost_per_token * max_prompt * len(requests))
+        outputs: List[List[int]] = [[] for _ in requests]
+        step_times: List[float] = []
+        for step in range(max(r.max_new_tokens for r in requests)):
+            if self.decode_cost_per_token and step:
+                time.sleep(self.decode_cost_per_token)
+            for i, r in enumerate(requests):
+                if step < r.max_new_tokens:
+                    outputs[i].append(self.next_token(r.prompt_ids, outputs[i]))
+            step_times.append(time.perf_counter())
+        finish = time.perf_counter()
+        return [
+            GenerationResult(
+                request_id=r.request_id,
+                output_ids=outputs[i],
+                service_start=service_start,
+                token_times=step_times[: r.max_new_tokens],
+                finish_time=finish,
+                finish_reason="length",
+            )
+            for i, r in enumerate(requests)
+        ]
