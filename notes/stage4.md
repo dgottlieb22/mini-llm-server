@@ -88,13 +88,20 @@ Engine counters, paged:
 |---|---:|---:|---:|---:|---:|---:|
 | offline | 23.4 ms | 32.0 | 1.05 | 6144 (75%) | 2016 | 0 |
 | uniform_8x | 21.9 ms | 13.8 | 1.13 | 5376 (66%) | 1156 | 0 |
-| hetero_4x | 30.6 ms | 12.8 | 1.56 | 8192 (100%) | 2387 | 240 |
+| hetero_4x | 30.6 ms | 12.8 | 1.93 (see note) | 8192 (100%) | 2387 | 240 |
 | hetero_4x, live 4096 | 26.3 ms | 10.2 | 1.54 | 5776 (71%) | 1685 | 453 |
 | hetero_hi | 19.3 ms | 2.8 | 1.23 | 2704 (33%) | 768 | 0 |
 | uniform | 23.7 ms | 1.5 | 1.06 | 576 (7%) | 185 | 0 |
 
 For comparison the slot engine's peak allocation is 8192 on every saturated
 workload with 1382-3568 resident (17-44%).
+
+Note on the attention column: in the first stage 4 runs the core's counters
+were not reset after the warm-up, so the warm-up's 12 identical-length
+dummy sequences (padding ratio 1.0) diluted the ratio; the `hetero_4x`
+value measured 1.56 that way. A re-run with the counter reset in place
+(`results/stage4/..._hetero_4x_20261015-163306.json`) gives 1.93, which is
+the figure used below. The other rows' ratios are close to 1 either way.
 
 ## What the numbers say
 
@@ -115,7 +122,8 @@ throughput is lower (3.0 vs 3.35 req/s) with worse TPOT and e2e tails,
 though the median queue wait halved. With long contexts (up to 768) the
 per-step copy of the live KV is 13 sequences x up to 48 blocks x 48 KB per
 layer, about 30 MB per layer, 720 MB per step, and the padded batch
-computes 1.56 positions per live one. The step is bound by KV traffic, and
+computes 1.93 positions per live one (sequences of 30 and 760 tokens share
+one padded batch). The step is bound by KV traffic, and
 the gather adds a full read and write of that KV on top of the read the
 attention does anyway. Bounding live tokens to 4096 brought the step to
 26 ms but admitted fewer sequences and lost throughput; the bound trades
