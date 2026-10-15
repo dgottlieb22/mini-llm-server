@@ -204,19 +204,31 @@ class ContinuousBatchEngine:
                     self._reject(request, fut, f"prompt {request.prompt_len} + output {request.max_new_tokens} "
                                                f"cannot fit in the cache")
                     continue
-                if not self.core.can_admit(request.prompt_len, request.max_new_tokens) or \
+                if not self._can_admit(request) or \
                         not self._within_live_budget(request, group):
                     self._admission_waits += 1
                     break
                 if group and not self._fits_prefill_batch(group, request):
                     break  # prefill what we have; this request starts the next group
                 self._pending.popleft()
-                group.append((request, fut, self.core.admit(request.prompt_len, request.max_new_tokens)))
+                group.append((request, fut, self._do_admit(request)))
                 if not self.prefill_batch_tokens:
                     break  # one at a time
             if not group:
                 return
             await self._prefill_group(loop, group)
+
+    def _can_admit(self, request: GenerationRequest) -> bool:
+        if hasattr(self.core, "can_admit_prompt"):  # prefix caching: depends on the tokens
+            return self.core.can_admit_prompt(request.prompt_ids, request.max_new_tokens)
+        return self.core.can_admit(request.prompt_len, request.max_new_tokens)
+
+    def _do_admit(self, request: GenerationRequest) -> Any:
+        if hasattr(self.core, "admit_prompt"):
+            handle = self.core.admit_prompt(request.prompt_ids, request.max_new_tokens)
+            self._cached_prompt_tokens += getattr(handle, "cached_tokens", 0)
+            return handle
+        return self.core.admit(request.prompt_len, request.max_new_tokens)
 
     def _fits_prefill_batch(self, group, request: GenerationRequest) -> bool:
         longest = max(request.prompt_len, max(r.prompt_len for r, _, _ in group))
@@ -335,6 +347,7 @@ class ContinuousBatchEngine:
         self._prefill_time = 0.0
         self._prefill_tokens = 0
         self._prefill_padded_tokens = 0
+        self._cached_prompt_tokens = 0
         self._kv_peak_resident_tokens = 0
         self._kv_peak_allocated_tokens = 0
 
@@ -367,6 +380,7 @@ class ContinuousBatchEngine:
             "prefill_tokens": self._prefill_tokens,
             "prefill_padded_tokens": self._prefill_padded_tokens,
             "prefill_batch_tokens": self.prefill_batch_tokens,
+            "cached_prompt_tokens": self._cached_prompt_tokens,
             "kv_budget_tokens": self.core.budget_tokens,
             "kv_peak_resident_tokens": self._kv_peak_resident_tokens,
             "kv_peak_allocated_tokens": self._kv_peak_allocated_tokens,

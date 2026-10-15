@@ -215,4 +215,17 @@ WORKLOADS: Dict[str, WorkloadSpec] = {
         arrival="poisson", rate=4.0,
         description="Heterogeneous lengths (prompt 16-512, output 8-256), Poisson at 4 req/s, 64 requests.",
     ),
+    # Added at stage 6: every prompt starts with the same 256 tokens (a system
+    # prompt), followed by its own 32-256 tokens. Two rates: one the paged
+    # engine carries with room, one that saturates it.
+    "prefix_2x": WorkloadSpec(
+        name="prefix_2x", num_requests=64, prompt_len=_uniform(288, 512), gen_len=_uniform(16, 128),
+        arrival="poisson", rate=2.0, shared_prefix_len=256,
+        description="256-token shared prefix + 32-256 own tokens, output 16-128, Poisson at 2 req/s.",
+    ),
+    "prefix_4x": WorkloadSpec(
+        name="prefix_4x", num_requests=64, prompt_len=_uniform(288, 512), gen_len=_uniform(16, 128),
+        arrival="poisson", rate=4.0, shared_prefix_len=256,
+        description="256-token shared prefix + 32-256 own tokens, output 16-128, Poisson at 4 req/s.",
+    ),
 }

@@ -90,6 +90,12 @@ class HFModelRunner:
         return PagedGPT2Core(self.model, budget_tokens=kv_budget_tokens, block_size=block_size,
                              max_seq_len=max_seq_len)
 
+    def make_prefix_cached_core(self, kv_budget_tokens: int, block_size: int, max_seq_len: int):
+        from .prefix_cache import PrefixCachedGPT2Core
+
+        return PrefixCachedGPT2Core(self.model, budget_tokens=kv_budget_tokens, block_size=block_size,
+                                    max_seq_len=max_seq_len)
+
     def generate_one(self, request: GenerationRequest) -> GenerationResult:
         import torch
 
