@@ -17,6 +17,7 @@ result file or a probe whose raw output is committed next to it.
 | stage | engine | what changed | notes |
 |---|---|---|---|
 | 0 | `naive` | one request at a time, whole request to `generate()` | [notes/stage0.md](notes/stage0.md) |
+| 1 | `async_serial` | async intake + FIFO queue; model still serial on a worker thread. Predicted and measured: no change | [notes/stage1.md](notes/stage1.md) |
 
 Everything so far ran on a CPU-only host (AMD EPYC 9R14, 64 cores) with
 GPT-2 small in fp32. GPU utilization and GPU memory are recorded as "not
@@ -33,6 +34,7 @@ miniserve/
   engines/
     base.py             the Engine interface every stage implements
     naive.py            stage 0
+    async_serial.py     stage 1
   bench/
     workload.py         WorkloadSpec, length distributions, arrival processes, presets
     harness.py          asyncio load generator; replays a workload against any engine
