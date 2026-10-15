@@ -309,6 +309,7 @@ class FakeCore:
         self.slots: List[Optional[List[int]]] = [None] * max_slots   # prompt ids per slot
         self.generated: List[List[int]] = [[] for _ in range(max_slots)]
         self.prefills: List[int] = []            # slot per prefill call
+        self.prefill_batches: List[List[int]] = []
         self.decode_calls: List[List[int]] = []  # active slots per decode call
         self._free_slots: List[int] = list(range(max_slots - 1, -1, -1))
         self._torch = torch
@@ -357,6 +358,19 @@ class FakeCore:
         self.generated[slot] = []
         return self._logits_for(self.runner.next_token(list(token_ids), [])).unsqueeze(0)
 
+    def prefill_batch(self, slots: Sequence[int], prompts: Sequence[Sequence[int]]):
+        """Like the real core: one call, padded cost (max prompt x rows)."""
+        self.prefill_batches.append(list(slots))
+        if self.runner.prefill_cost_per_token:
+            time.sleep(self.runner.prefill_cost_per_token * max(len(p) for p in prompts) * len(prompts))
+        rows = []
+        for s, p in zip(slots, prompts):
+            self.prefills.append(s)
+            self.slots[s] = list(p)
+            self.generated[s] = []
+            rows.append(self._logits_for(self.runner.next_token(list(p), [])))
+        return self._torch.stack(rows)
+
     def decode(self, slots: Sequence[int], tokens: Sequence[int], positions: Sequence[int]):
         if self.runner.decode_cost_per_token:
             time.sleep(self.runner.decode_cost_per_token)
@@ -389,6 +403,7 @@ class FakePagedCore:
         self._torch = torch
         self.history: Dict[int, List[int]] = {}      # id(handle) -> prompt + generated so far
         self.prefills = 0
+        self.prefill_batches: List[int] = []
         self.decode_calls: List[int] = []           # active count per decode call
 
     @property
@@ -439,6 +454,20 @@ class FakePagedCore:
         self.history[id(handle)] = list(token_ids)
         handle.fake_prompt_len = len(token_ids)
         return self._logits_for(self.runner.next_token(list(token_ids), [])).unsqueeze(0)
+
+    def prefill_batch(self, handles, prompts: Sequence[Sequence[int]]):
+        self.prefill_batches.append(len(handles))
+        if self.runner.prefill_cost_per_token:
+            time.sleep(self.runner.prefill_cost_per_token * max(len(p) for p in prompts) * len(prompts))
+        rows = []
+        for h, p in zip(handles, prompts):
+            if len(p) > h.capacity:
+                raise ValueError("prompt exceeds block table capacity")
+            self.prefills += 1
+            self.history[id(h)] = list(p)
+            h.fake_prompt_len = len(p)
+            rows.append(self._logits_for(self.runner.next_token(list(p), [])))
+        return self._torch.stack(rows)
 
     def decode(self, handles, tokens: Sequence[int], positions: Sequence[int]):
         if self.runner.decode_cost_per_token:

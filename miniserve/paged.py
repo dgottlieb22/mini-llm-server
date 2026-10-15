@@ -195,6 +195,38 @@ class PagedGPT2Core(GPT2Core):
         return self._logits(x[:, -1])
 
     @torch.inference_mode()
+    def prefill_batch(self, handles: Sequence[BlockTable], prompts: Sequence[Sequence[int]]) -> torch.Tensor:
+        """Several sequences in one right-padded forward (see GPT2Core.prefill_batch)."""
+        B = len(handles)
+        lens = [len(p) for p in prompts]
+        P = max(lens)
+        for h, n in zip(handles, lens):
+            if n > h.capacity:
+                raise ValueError(f"prompt of {n} tokens exceeds the block table's capacity {h.capacity}")
+        ids = torch.zeros((B, P), dtype=torch.long, device=self.device)
+        for i, p in enumerate(prompts):
+            ids[i, :len(p)] = torch.as_tensor(p, dtype=torch.long, device=self.device)
+        x = self.wte[ids] + self.wpe[:P].unsqueeze(0)
+        plans = []  # per row: (block ids tensor, number of blocks, pad)
+        for h, n in zip(handles, lens):
+            nb = self.allocator.blocks_needed(n)
+            plans.append((torch.as_tensor(h.blocks[:nb], dtype=torch.long, device=self.device), nb,
+                          nb * self.block_size - n))
+        for layer, L in enumerate(self.layers):
+            q, k, v = self._qkv(self._ln(x, L["ln1_w"], L["ln1_b"]), L)  # [B, H, P, hd]
+            for i, (blocks, nb, pad) in enumerate(plans):
+                n = lens[i]
+                for cache, t in ((self.k_cache, k), (self.v_cache, v)):
+                    tt = t[i, :, :n].transpose(0, 1)  # [n, H, hd]
+                    if pad:
+                        tt = F.pad(tt, (0, 0, 0, 0, 0, pad))
+                    cache[layer][blocks] = tt.reshape(nb, self.block_size, self.n_head, self.head_dim)
+            att = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            x = self._finish_block(x, att, L)
+        last = torch.as_tensor([n - 1 for n in lens], device=self.device)
+        return self._logits(x[torch.arange(B, device=self.device), last])
+
+    @torch.inference_mode()
     def decode(self, handles: Sequence[BlockTable], tokens: Sequence[int], positions: Sequence[int]) -> torch.Tensor:
         """One step for the active sequences only. Returns logits [len(handles), vocab]."""
         B = len(handles)

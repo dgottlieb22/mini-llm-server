@@ -155,6 +155,34 @@ class GPT2Core:
         return self._logits(x[:, -1])  # [1, vocab]
 
     @torch.inference_mode()
+    def prefill_batch(self, handles: Sequence[int], prompts: Sequence[Sequence[int]]) -> torch.Tensor:
+        """Prefill several sequences in one forward; returns logits [B, vocab] at each last position.
+
+        Rows are right-padded to the longest prompt. With causal attention a
+        pad at the end of a row cannot influence the real positions before
+        it, so no mask is needed; the padded rows' extra K/V are simply not
+        written. The waste is the padded compute, which the engine counts.
+        """
+        B = len(handles)
+        lens = [len(p) for p in prompts]
+        P = max(lens)
+        if P > self.max_seq_len:
+            raise ValueError(f"prompt of {P} tokens exceeds max_seq_len {self.max_seq_len}")
+        ids = torch.zeros((B, P), dtype=torch.long, device=self.device)
+        for i, p in enumerate(prompts):
+            ids[i, :len(p)] = torch.as_tensor(p, dtype=torch.long, device=self.device)
+        x = self.wte[ids] + self.wpe[:P].unsqueeze(0)  # [B, P, d]
+        for layer, L in enumerate(self.layers):
+            q, k, v = self._qkv(self._ln(x, L["ln1_w"], L["ln1_b"]), L)  # [B, H, P, hd]
+            for i, (slot, n) in enumerate(zip(handles, lens)):
+                self.k_cache[layer, slot, :, :n] = k[i, :, :n]
+                self.v_cache[layer, slot, :, :n] = v[i, :, :n]
+            att = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            x = self._finish_block(x, att, L)
+        last = torch.as_tensor([n - 1 for n in lens], device=self.device)
+        return self._logits(x[torch.arange(B, device=self.device), last])
+
+    @torch.inference_mode()
     def decode(self, slots: Sequence[int], tokens: Sequence[int], positions: Sequence[int]) -> torch.Tensor:
         """One step for the active `slots`: token i goes in at positions[i] of slot i.
 

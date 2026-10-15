@@ -19,13 +19,14 @@ class PagedEngine(ContinuousBatchEngine):
     stage = 4
 
     def __init__(self, runner: ModelRunner, kv_budget_tokens: int = 8192, block_size: int = 16,
-                 max_seq_len: int = 1024, max_live_tokens: Optional[int] = None) -> None:
+                 max_seq_len: int = 1024, max_live_tokens: Optional[int] = None,
+                 prefill_batch_tokens: int = 0) -> None:
         if kv_budget_tokens < block_size or block_size < 1:
             raise ValueError("need kv_budget_tokens >= block_size >= 1")
         self.kv_budget_tokens, self.block_size = kv_budget_tokens, block_size
         # max_slots is only used by the parent for its own stats; the budget is what binds here.
         super().__init__(runner, max_slots=kv_budget_tokens // block_size, max_seq_len=max_seq_len,
-                         max_live_tokens=max_live_tokens)
+                         max_live_tokens=max_live_tokens, prefill_batch_tokens=prefill_batch_tokens)
         self._kv_peak_fragmentation = 0
 
     def _make_core(self):

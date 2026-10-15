@@ -59,17 +59,21 @@ class ContinuousBatchEngine:
     stage = 3
 
     def __init__(self, runner: ModelRunner, max_slots: int = 8, max_seq_len: int = 1024,
-                 max_live_tokens: Optional[int] = None) -> None:
+                 max_live_tokens: Optional[int] = None, prefill_batch_tokens: int = 0) -> None:
         if max_slots < 1 or max_seq_len < 2:
             raise ValueError("need max_slots >= 1 and max_seq_len >= 2")
         if max_live_tokens is not None and max_live_tokens < max_seq_len:
             raise ValueError("max_live_tokens must be at least max_seq_len or no request could run")
+        if prefill_batch_tokens < 0:
+            raise ValueError("prefill_batch_tokens must be >= 0 (0 = prefill one request at a time)")
         self.runner = runner
         self.max_slots, self.max_seq_len = max_slots, max_seq_len
         # Bound on tokens resident across running sequences. Memory is what
         # the core's can_admit() checks; this bounds the work of a decode step,
         # which reads every resident token's K/V. None = memory only.
         self.max_live_tokens = max_live_tokens
+        # Cap on rows x longest prompt for one batched prefill forward; 0 = one at a time.
+        self.prefill_batch_tokens = prefill_batch_tokens
         self.core = self._make_core()
         self._pending: Deque[_QueueItem] = deque()
         self._running: Dict[str, _Seq] = {}   # by request id, in admission order
@@ -175,62 +179,98 @@ class ContinuousBatchEngine:
             fut.set_exception(ValueError(f"{request.request_id}: {why}"))
 
     async def _admit(self) -> None:
-        """Move queued requests into the cache, FIFO, prefilling each one.
+        """Move queued requests into the cache, FIFO, and prefill them.
 
         Stops at the first request that does not fit right now: admitting a
         later, smaller request ahead of it would starve the big one.
+
+        With prefill_batch_tokens > 0, the requests admitted in one pass are
+        prefilled together in one right-padded forward, as long as the padded
+        size (rows x longest prompt) stays within the cap; otherwise one at a
+        time. Stage 5 measures the difference.
         """
         assert self._executor is not None
         loop = asyncio.get_running_loop()
         while self._pending:
-            request, fut = self._pending[0]
-            if fut.cancelled():
+            group: List[Tuple[GenerationRequest, "asyncio.Future[GenerationResult]", Any]] = []
+            while self._pending:
+                request, fut = self._pending[0]
+                if fut.cancelled():
+                    self._pending.popleft()
+                    self._cancelled += 1
+                    continue
+                if not self.core.fits(request.prompt_len, request.max_new_tokens):
+                    self._pending.popleft()
+                    self._reject(request, fut, f"prompt {request.prompt_len} + output {request.max_new_tokens} "
+                                               f"cannot fit in the cache")
+                    continue
+                if not self.core.can_admit(request.prompt_len, request.max_new_tokens) or \
+                        not self._within_live_budget(request, group):
+                    self._admission_waits += 1
+                    break
+                if group and not self._fits_prefill_batch(group, request):
+                    break  # prefill what we have; this request starts the next group
                 self._pending.popleft()
-                self._cancelled += 1
-                continue
-            if not self.core.fits(request.prompt_len, request.max_new_tokens):
-                self._pending.popleft()
-                self._reject(request, fut, f"prompt {request.prompt_len} + output {request.max_new_tokens} "
-                                           f"cannot fit in the cache")
-                continue
-            if not self.core.can_admit(request.prompt_len, request.max_new_tokens) or \
-                    not self._within_live_budget(request):
-                self._admission_waits += 1
-                break
-            self._pending.popleft()
-            handle = self.core.admit(request.prompt_len, request.max_new_tokens)
-            t0 = time.perf_counter()
-            try:
-                tok = await loop.run_in_executor(self._executor, self._prefill_and_pick, handle, request)
-            except Exception as exc:  # noqa: BLE001 (handed to the caller)
-                self.core.free(handle)
+                group.append((request, fut, self.core.admit(request.prompt_len, request.max_new_tokens)))
+                if not self.prefill_batch_tokens:
+                    break  # one at a time
+            if not group:
+                return
+            await self._prefill_group(loop, group)
+
+    def _fits_prefill_batch(self, group, request: GenerationRequest) -> bool:
+        longest = max(request.prompt_len, max(r.prompt_len for r, _, _ in group))
+        return (len(group) + 1) * longest <= self.prefill_batch_tokens
+
+    async def _prefill_group(self, loop, group) -> None:
+        assert self._executor is not None
+        requests = [r for r, _, _ in group]
+        handles = [h for _, _, h in group]
+        t0 = time.perf_counter()
+        try:
+            if len(group) == 1:
+                toks = [await loop.run_in_executor(self._executor, self._prefill_and_pick, handles[0], requests[0])]
+            else:
+                toks = await loop.run_in_executor(self._executor, self._prefill_batch_and_pick, handles, requests)
+        except Exception as exc:  # noqa: BLE001 (handed to every caller in the group)
+            for _, fut, h in group:
+                self.core.free(h)
                 if not fut.done():
                     fut.set_exception(exc)
-                continue
-            t1 = time.perf_counter()
-            self._prefill_count += 1
-            self._prefill_time += t1 - t0
-            self._prefill_tokens += request.prompt_len
+            return
+        t1 = time.perf_counter()
+        longest = max(r.prompt_len for r in requests)
+        self._prefill_count += len(group)
+        self._prefill_batches += 1
+        self._prefill_time += t1 - t0
+        self._prefill_tokens += sum(r.prompt_len for r in requests)
+        self._prefill_padded_tokens += longest * len(group)
+        for (request, fut, handle), tok in zip(group, toks):
             seq = _Seq(request, fut, handle, service_start=t0, output=[tok], token_times=[t1],
                        cache_len=request.prompt_len)
             self._running[request.request_id] = seq
-            self._note_kv_usage()
             if seq.done or self._stopped_on_eos(seq, tok):
                 self._finish(seq, t1)
+        self._note_kv_usage()
+
+    def _prefill_batch_and_pick(self, handles: List[Any], requests: List[GenerationRequest]) -> List[int]:
+        logits = self.core.prefill_batch(handles, [r.prompt_ids for r in requests])
+        return self._pick(logits, requests)
 
     def _stopped_on_eos(self, seq: _Seq, tok: int) -> bool:
         return (not seq.request.force_length) and tok == self.core.eos_token_id
 
-    def _within_live_budget(self, request: GenerationRequest) -> bool:
+    def _within_live_budget(self, request: GenerationRequest, group=()) -> bool:
         """Would admitting this request keep resident tokens under max_live_tokens?
 
-        Counts what is resident now plus the new prompt. Running sequences
-        keep growing by one token per step, so this is a soft bound on the
-        step's work, not a hard one; an empty engine always admits.
+        Counts what is resident now, the prompts already admitted in this
+        pass, plus the new prompt. Running sequences keep growing by one
+        token per step, so this is a soft bound on the step's work, not a
+        hard one; an empty engine always admits.
         """
-        if self.max_live_tokens is None or not self._running:
+        if self.max_live_tokens is None or (not self._running and not group):
             return True
-        resident = sum(s.cache_len + 1 for s in self._running.values())
+        resident = sum(s.cache_len + 1 for s in self._running.values()) + sum(r.prompt_len for r, _, _ in group)
         return resident + request.prompt_len <= self.max_live_tokens
 
     async def _step(self) -> None:
@@ -291,8 +331,10 @@ class ContinuousBatchEngine:
         self._decode_time = 0.0
         self._active_sum = 0
         self._prefill_count = 0
+        self._prefill_batches = 0
         self._prefill_time = 0.0
         self._prefill_tokens = 0
+        self._prefill_padded_tokens = 0
         self._kv_peak_resident_tokens = 0
         self._kv_peak_allocated_tokens = 0
 
@@ -320,8 +362,11 @@ class ContinuousBatchEngine:
             "decode_step_mean_ms": 1000 * self._decode_time / steps if steps else None,
             "mean_active_per_step": self._active_sum / steps if steps else None,
             "prefill_count": self._prefill_count,
+            "prefill_batches": self._prefill_batches,
             "prefill_time_s": self._prefill_time,
             "prefill_tokens": self._prefill_tokens,
+            "prefill_padded_tokens": self._prefill_padded_tokens,
+            "prefill_batch_tokens": self.prefill_batch_tokens,
             "kv_budget_tokens": self.core.budget_tokens,
             "kv_peak_resident_tokens": self._kv_peak_resident_tokens,
             "kv_peak_allocated_tokens": self._kv_peak_allocated_tokens,
