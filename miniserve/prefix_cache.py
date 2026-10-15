@@ -137,6 +137,26 @@ class PrefixCachedGPT2Core(PagedGPT2Core):
         self.allocator.free(to_allocator)
         handle.blocks = []
 
+    def allocated_tokens(self, handles: Sequence[BlockTable]) -> int:
+        """Physical blocks held by these sequences, shared blocks counted once."""
+        blocks = set()
+        for h in handles:
+            blocks.update(h.blocks)
+        return len(blocks) * self.block_size
+
+    def reset_stats(self) -> None:
+        super().reset_stats()
+        self.cache_hits_blocks = self.cache_miss_blocks = self.evictions = 0
+
+    def clear_cache(self) -> None:
+        """Drop every indexed block no sequence holds (used after warm-up)."""
+        for h, b in list(self.index.items()):
+            if self.refcount.get(b, 0) == 1:
+                del self.index[h]
+                del self.refcount[b]
+                del self.block_hash[b]
+                self.allocator.free([b])
+
     def _register(self, handle: BlockTable, token_ids: Sequence[int]) -> None:
         """After a prefill, index this prompt's newly computed full blocks."""
         hashes = self._prefix_hashes(token_ids)

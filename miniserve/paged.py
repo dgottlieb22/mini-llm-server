@@ -265,6 +265,10 @@ class PagedGPT2Core(GPT2Core):
             x = self._finish_block(x, att, L)
         return self._logits(x[:, 0])
 
+    def reset_stats(self) -> None:
+        self.attn_positions_computed = self.attn_positions_live = 0
+        self.allocator.allocations = self.allocator.frees = 0
+
     def stats(self) -> Dict[str, object]:
         return {
             "block_size": self.block_size,

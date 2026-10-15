@@ -75,6 +75,9 @@ class GPT2Core:
         self.attn_positions_computed = 0
         self.attn_positions_live = 0
 
+    def reset_stats(self) -> None:
+        self.attn_positions_computed = self.attn_positions_live = 0
+
     # ---- allocation: one max_seq_len reservation per sequence --------------
 
     @property

@@ -119,6 +119,12 @@ class ContinuousBatchEngine:
         n = self._warmup_count(prompt_len, gen_len)
         reqs = [dummy_request(f"warmup-{i}", prompt_len, gen_len) for i in range(n)]
         await asyncio.gather(*(self.generate(r) for r in reqs))
+        # Warm-up must not leak into the measurement: engine counters, the
+        # core's counters, and (with prefix caching) the dummy prompts' blocks.
+        if hasattr(self.core, "clear_cache"):
+            self.core.clear_cache()
+        if hasattr(self.core, "reset_stats"):
+            self.core.reset_stats()
         self._reset_stats()
 
     # ---- client API ------------------------------------------------------

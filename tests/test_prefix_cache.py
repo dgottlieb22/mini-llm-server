@@ -98,6 +98,23 @@ def test_free_never_returns_a_block_someone_else_holds(tiny):
     assert all(b not in core.allocator._free for b in shared)
 
 
+def test_shared_blocks_are_counted_once_and_warmup_leaves_no_trace(tiny):
+    core = PrefixCachedGPT2Core(tiny, budget_tokens=64, block_size=4, max_seq_len=64)
+    ha = core.admit_prompt(A, 1)
+    core.prefill(ha, A)
+    hb = core.admit_prompt(B, 1)
+    core.prefill(hb, B)
+    # A: 4 blocks, B: 5 blocks, 3 shared -> 6 physical blocks = 24 tokens
+    assert core.allocated_tokens([ha, hb]) == 24
+    core.free(ha)
+    core.free(hb)
+    assert core.cache_hits_blocks == 3
+    core.clear_cache()
+    core.reset_stats()
+    assert core.cached_blocks == 0 and core.cache_hits_blocks == 0
+    assert core.allocator.num_free == core.allocator.num_usable
+
+
 def _spec(prefix, **over):
     base = dict(
         name="t", num_requests=8, prompt_len=LengthSpec("uniform", low=20, high=28),
