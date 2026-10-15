@@ -1,27 +1,26 @@
 """Stage 3: continuous batching.
 
     request -> queue -> [engine loop, every step:
-                           free the slots of finished or cancelled sequences,
-                           admit queued requests into free slots (prefill each),
-                           run one decode step over every active slot]
+                           release the storage of finished or cancelled sequences,
+                           admit queued requests the cache can hold (prefill each),
+                           run one decode step over every active sequence]
                      -> token per active sequence per step
 
 The batch is no longer a fixed set. A sequence joins the running batch the
-step after a slot frees up and leaves the moment its own output is done;
+step after storage frees up and leaves the moment its own output is done;
 its result returns right then, not when the slowest member finishes. The
 unit of scheduling is one decode step.
 
 What this costs: a prefill runs inside the loop, so every other sequence
 waits through it (the stats record prefill time separately so the effect on
-TPOT is attributable), and the engine computes all max_slots slots every
-step whether or not they are occupied (see miniserve/gpt2.py for why; the
-stats record slot utilization).
+TPOT is attributable).
 
-The KV cache is explicit from here on: GPT2Core reserves max_seq_len
-positions per slot, so the engine's admission rule is "a request needs a
-free slot and prompt_len + max_new_tokens <= max_seq_len". There is no
-mid-generation out-of-memory: a slot always has room for the sequence it
-admitted. The price is the reservation itself, which stage 4 measures.
+The KV cache is explicit from here on, and the engine does not know how it
+is organized. The core answers can_admit()/admit()/free(): at stage 3 the
+storage unit is a slot of max_seq_len positions (one reservation per
+sequence, so there is no mid-generation out-of-memory and the price is the
+reservation itself); stage 4 swaps in a block-granular core behind the same
+three calls. Requests that could never fit are rejected at admission.
 """
 from __future__ import annotations
 
@@ -30,8 +29,8 @@ import math
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from ..gpt2 import argmax_tokens
 from ..model import ModelRunner
@@ -44,11 +43,11 @@ _QueueItem = Tuple[GenerationRequest, "asyncio.Future[GenerationResult]"]
 class _Seq:
     request: GenerationRequest
     fut: "asyncio.Future[GenerationResult]"
-    slot: int
+    handle: Any                 # the core's storage handle (slot id, or block table)
     service_start: float
     output: List[int]
     token_times: List[float]
-    cache_len: int  # tokens whose K/V are in the slot; the last output token is not yet among them
+    cache_len: int  # tokens whose K/V are in the cache; the last output token is not yet among them
 
     @property
     def done(self) -> bool:
@@ -64,14 +63,16 @@ class ContinuousBatchEngine:
             raise ValueError("need max_slots >= 1 and max_seq_len >= 2")
         self.runner = runner
         self.max_slots, self.max_seq_len = max_slots, max_seq_len
-        self.core = runner.make_core(max_slots, max_seq_len)
+        self.core = self._make_core()
         self._pending: Deque[_QueueItem] = deque()
-        self._running: Dict[int, _Seq] = {}
-        self._free_slots: List[int] = list(range(max_slots - 1, -1, -1))
+        self._running: Dict[str, _Seq] = {}   # by request id, in admission order
         self._wake: Optional[asyncio.Event] = None
         self._loop_task: Optional["asyncio.Task[None]"] = None
         self._executor: Optional[ThreadPoolExecutor] = None
         self._reset_stats()
+
+    def _make_core(self):
+        return self.runner.make_core(self.max_slots, self.max_seq_len)
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -96,12 +97,16 @@ class ContinuousBatchEngine:
         self._executor.shutdown(wait=True)
         self._loop_task = None
 
+    def _warmup_count(self, prompt_len: int, gen_len: int) -> int:
+        return self.max_slots
+
     async def warmup(self, prompt_len: int, gen_len: int) -> None:
-        """Fill every slot once at the largest shape, through the normal path."""
+        """Fill the cache once at the largest shape, through the normal path."""
         if self._loop_task is None:
             await self.start()
         prompt_len = min(prompt_len, self.max_seq_len - gen_len)
-        reqs = [dummy_request(f"warmup-{i}", prompt_len, gen_len) for i in range(self.max_slots)]
+        n = self._warmup_count(prompt_len, gen_len)
+        reqs = [dummy_request(f"warmup-{i}", prompt_len, gen_len) for i in range(n)]
         await asyncio.gather(*(self.generate(r) for r in reqs))
         self._reset_stats()
 
@@ -118,7 +123,7 @@ class ContinuousBatchEngine:
         try:
             return await fut
         except asyncio.CancelledError:
-            fut.cancel()  # the loop sees this at the next step boundary and frees the slot
+            fut.cancel()  # the loop sees this at the next step boundary and frees the storage
             raise
 
     # ---- model calls (run on the worker thread) --------------------------
@@ -127,13 +132,13 @@ class ContinuousBatchEngine:
     # tensor: scripts/probe_engine_step.py measured 3 ms per step of
     # main-thread work when the argmax ran there, on a 16.6 ms decode.
 
-    def _prefill_and_pick(self, slot: int, request: GenerationRequest) -> int:
-        logits = self.core.prefill(slot, request.prompt_ids)
+    def _prefill_and_pick(self, handle: Any, request: GenerationRequest) -> int:
+        logits = self.core.prefill(handle, request.prompt_ids)
         return self._pick(logits, [request])[0]
 
-    def _decode_and_pick(self, slots: List[int], tokens: List[int], positions: List[int],
+    def _decode_and_pick(self, handles: List[Any], tokens: List[int], positions: List[int],
                          requests: List[GenerationRequest]) -> List[int]:
-        logits = self.core.decode(slots, tokens, positions)
+        logits = self.core.decode(handles, tokens, positions)
         return self._pick(logits, requests)
 
     def _pick(self, logits, requests: List[GenerationRequest]) -> List[int]:
@@ -163,24 +168,34 @@ class ContinuousBatchEngine:
             fut.set_exception(ValueError(f"{request.request_id}: {why}"))
 
     async def _admit(self) -> None:
-        """Move queued requests into free slots, prefilling each one."""
+        """Move queued requests into the cache, FIFO, prefilling each one.
+
+        Stops at the first request that does not fit right now: admitting a
+        later, smaller request ahead of it would starve the big one.
+        """
         assert self._executor is not None
         loop = asyncio.get_running_loop()
-        while self._pending and self._free_slots:
-            request, fut = self._pending.popleft()
+        while self._pending:
+            request, fut = self._pending[0]
             if fut.cancelled():
+                self._pending.popleft()
                 self._cancelled += 1
                 continue
-            if request.prompt_len + request.max_new_tokens > self.max_seq_len:
+            if not self.core.fits(request.prompt_len, request.max_new_tokens):
+                self._pending.popleft()
                 self._reject(request, fut, f"prompt {request.prompt_len} + output {request.max_new_tokens} "
-                                           f"exceeds max_seq_len {self.max_seq_len}")
+                                           f"cannot fit in the cache")
                 continue
-            slot = self._free_slots.pop()
+            if not self.core.can_admit(request.prompt_len, request.max_new_tokens):
+                self._admission_waits += 1
+                break
+            self._pending.popleft()
+            handle = self.core.admit(request.prompt_len, request.max_new_tokens)
             t0 = time.perf_counter()
             try:
-                tok = await loop.run_in_executor(self._executor, self._prefill_and_pick, slot, request)
+                tok = await loop.run_in_executor(self._executor, self._prefill_and_pick, handle, request)
             except Exception as exc:  # noqa: BLE001 (handed to the caller)
-                self._free_slots.append(slot)
+                self.core.free(handle)
                 if not fut.done():
                     fut.set_exception(exc)
                 continue
@@ -188,9 +203,9 @@ class ContinuousBatchEngine:
             self._prefill_count += 1
             self._prefill_time += t1 - t0
             self._prefill_tokens += request.prompt_len
-            seq = _Seq(request, fut, slot, service_start=t0, output=[tok], token_times=[t1],
+            seq = _Seq(request, fut, handle, service_start=t0, output=[tok], token_times=[t1],
                        cache_len=request.prompt_len)
-            self._running[slot] = seq
+            self._running[request.request_id] = seq
             self._note_kv_usage()
             if seq.done or self._stopped_on_eos(seq, tok):
                 self._finish(seq, t1)
@@ -199,22 +214,22 @@ class ContinuousBatchEngine:
         return (not seq.request.force_length) and tok == self.core.eos_token_id
 
     async def _step(self) -> None:
-        """One decode step over every active slot."""
+        """One decode step over every active sequence."""
         assert self._executor is not None
         loop = asyncio.get_running_loop()
-        for slot, seq in list(self._running.items()):
+        for seq in list(self._running.values()):
             if seq.fut.cancelled():
                 self._release(seq)
                 self._cancelled += 1
         if not self._running:
             return
         seqs = list(self._running.values())
-        slots = [s.slot for s in seqs]
+        handles = [s.handle for s in seqs]
         tokens = [s.output[-1] for s in seqs]
         positions = [s.cache_len for s in seqs]
         t0 = time.perf_counter()
         picks = await loop.run_in_executor(
-            self._executor, self._decode_and_pick, slots, tokens, positions, [s.request for s in seqs]
+            self._executor, self._decode_and_pick, handles, tokens, positions, [s.request for s in seqs]
         )
         t1 = time.perf_counter()
         self._decode_steps += 1
@@ -229,8 +244,8 @@ class ContinuousBatchEngine:
         self._note_kv_usage()
 
     def _release(self, seq: _Seq) -> None:
-        del self._running[seq.slot]
-        self._free_slots.append(seq.slot)
+        del self._running[seq.request.request_id]
+        self.core.free(seq.handle)
 
     def _finish(self, seq: _Seq, finish_time: float) -> None:
         self._release(seq)
@@ -250,6 +265,7 @@ class ContinuousBatchEngine:
 
     def _reset_stats(self) -> None:
         self._served = self._rejected = self._cancelled = 0
+        self._admission_waits = 0
         self._max_queue_depth = 0
         self._decode_steps = 0
         self._decode_time = 0.0
@@ -257,30 +273,46 @@ class ContinuousBatchEngine:
         self._prefill_count = 0
         self._prefill_time = 0.0
         self._prefill_tokens = 0
-        self._kv_peak_used_tokens = 0
+        self._kv_peak_resident_tokens = 0
+        self._kv_peak_allocated_tokens = 0
 
     def _note_kv_usage(self) -> None:
-        used = sum(s.cache_len + 1 for s in self._running.values())
-        self._kv_peak_used_tokens = max(self._kv_peak_used_tokens, used)
+        """Resident = tokens whose K/V are stored; allocated = positions reserved for them."""
+        resident = sum(s.cache_len + 1 for s in self._running.values())
+        allocated = self.core.allocated_tokens([s.handle for s in self._running.values()])
+        self._kv_peak_resident_tokens = max(self._kv_peak_resident_tokens, resident)
+        self._kv_peak_allocated_tokens = max(self._kv_peak_allocated_tokens, allocated)
+
+    def _concurrency_limit(self) -> int:
+        return self.max_slots
 
     def stats(self) -> Dict[str, object]:
         steps = self._decode_steps
-        return {
+        s: Dict[str, object] = {
             "served": self._served,
             "rejected": self._rejected,
             "cancelled": self._cancelled,
+            "admission_waits": self._admission_waits,
             "max_queue_depth": self._max_queue_depth,
-            "max_slots": self.max_slots,
             "max_seq_len": self.max_seq_len,
             "decode_steps": steps,
             "decode_time_s": self._decode_time,
             "decode_step_mean_ms": 1000 * self._decode_time / steps if steps else None,
             "mean_active_per_step": self._active_sum / steps if steps else None,
-            "slot_utilization": self._active_sum / (steps * self.max_slots) if steps else None,
             "prefill_count": self._prefill_count,
             "prefill_time_s": self._prefill_time,
             "prefill_tokens": self._prefill_tokens,
-            "kv_budget_tokens": self.max_slots * self.max_seq_len,
-            "kv_peak_used_tokens": self._kv_peak_used_tokens,
+            "kv_budget_tokens": self.core.budget_tokens,
+            "kv_peak_resident_tokens": self._kv_peak_resident_tokens,
+            "kv_peak_allocated_tokens": self._kv_peak_allocated_tokens,
             "kv_cache_bytes": self.core.cache_bytes,
+        }
+        s.update(self._extra_stats())
+        return s
+
+    def _extra_stats(self) -> Dict[str, object]:
+        steps = self._decode_steps
+        return {
+            "max_slots": self.max_slots,
+            "slot_utilization": self._active_sum / (steps * self.max_slots) if steps else None,
         }

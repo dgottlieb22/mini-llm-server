@@ -69,6 +69,33 @@ class GPT2Core:
         self.k_cache = torch.zeros(shape, dtype=self.dtype, device=self.device)
         self.v_cache = torch.zeros(shape, dtype=self.dtype, device=self.device)
         self._all_slots = torch.arange(max_slots, device=self.device)
+        self._free_slots: List[int] = list(range(max_slots - 1, -1, -1))
+
+    # ---- allocation: one max_seq_len reservation per sequence --------------
+
+    @property
+    def budget_tokens(self) -> int:
+        return self.max_slots * self.max_seq_len
+
+    def fits(self, prompt_len: int, max_new_tokens: int) -> bool:
+        """Could this request ever be admitted?"""
+        return prompt_len + max_new_tokens <= self.max_seq_len
+
+    def can_admit(self, prompt_len: int, max_new_tokens: int) -> bool:
+        return bool(self._free_slots) and self.fits(prompt_len, max_new_tokens)
+
+    def admit(self, prompt_len: int, max_new_tokens: int) -> int:
+        """Reserve storage for a sequence; returns the handle (here: the slot)."""
+        if not self.can_admit(prompt_len, max_new_tokens):
+            raise RuntimeError("admit() called without can_admit()")
+        return self._free_slots.pop()
+
+    def free(self, handle: int) -> None:
+        self._free_slots.append(handle)
+
+    def allocated_tokens(self, handles: Sequence[int]) -> int:
+        """Cache positions reserved for these sequences (whole slots)."""
+        return len(handles) * self.max_seq_len
 
     # ---- sizes -----------------------------------------------------------
 

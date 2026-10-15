@@ -10,7 +10,7 @@ HFModelRunner then becomes the thing that runs one forward pass.
 from __future__ import annotations
 
 import time
-from typing import List, Optional, Protocol, Sequence
+from typing import Dict, List, Optional, Protocol, Sequence
 
 from .request import GenerationRequest, GenerationResult
 
@@ -83,6 +83,12 @@ class HFModelRunner:
         from .gpt2 import GPT2Core
 
         return GPT2Core(self.model, max_slots=max_slots, max_seq_len=max_seq_len)
+
+    def make_paged_core(self, kv_budget_tokens: int, block_size: int, max_seq_len: int):
+        from .paged import PagedGPT2Core
+
+        return PagedGPT2Core(self.model, budget_tokens=kv_budget_tokens, block_size=block_size,
+                             max_seq_len=max_seq_len)
 
     def generate_one(self, request: GenerationRequest) -> GenerationResult:
         import torch
@@ -279,6 +285,9 @@ class FakeModelRunner:
     def make_core(self, max_slots: int, max_seq_len: int) -> "FakeCore":
         return FakeCore(self, max_slots, max_seq_len)
 
+    def make_paged_core(self, kv_budget_tokens: int, block_size: int, max_seq_len: int) -> "FakePagedCore":
+        return FakePagedCore(self, kv_budget_tokens, block_size, max_seq_len)
+
 
 class FakeCore:
     """Step-level stand-in for GPT2Core, producing FakeModelRunner's tokens.
@@ -301,7 +310,29 @@ class FakeCore:
         self.generated: List[List[int]] = [[] for _ in range(max_slots)]
         self.prefills: List[int] = []            # slot per prefill call
         self.decode_calls: List[List[int]] = []  # active slots per decode call
+        self._free_slots: List[int] = list(range(max_slots - 1, -1, -1))
         self._torch = torch
+
+    @property
+    def budget_tokens(self) -> int:
+        return self.max_slots * self.max_seq_len
+
+    def fits(self, prompt_len: int, max_new_tokens: int) -> bool:
+        return prompt_len + max_new_tokens <= self.max_seq_len
+
+    def can_admit(self, prompt_len: int, max_new_tokens: int) -> bool:
+        return bool(self._free_slots) and self.fits(prompt_len, max_new_tokens)
+
+    def admit(self, prompt_len: int, max_new_tokens: int) -> int:
+        if not self.can_admit(prompt_len, max_new_tokens):
+            raise RuntimeError("admit() called without can_admit()")
+        return self._free_slots.pop()
+
+    def free(self, handle: int) -> None:
+        self._free_slots.append(handle)
+
+    def allocated_tokens(self, handles: Sequence[int]) -> int:
+        return len(handles) * self.max_seq_len
 
     @property
     def kv_bytes_per_token(self) -> int:
@@ -338,3 +369,96 @@ class FakeCore:
             self.generated[s].append(tok)
             rows.append(self._logits_for(self.runner.next_token(prompt, self.generated[s])))
         return self._torch.stack(rows)
+
+
+class FakePagedCore:
+    """FakeCore over a real BlockAllocator: block accounting is exercised, tokens are fake."""
+
+    def __init__(self, runner: FakeModelRunner, kv_budget_tokens: int, block_size: int, max_seq_len: int) -> None:
+        import torch
+
+        from .paged import BlockAllocator, BlockTable
+
+        self.runner = runner
+        self.max_seq_len = max_seq_len
+        self.block_size = block_size
+        self.eos_token_id = runner.eos_token_id
+        self.vocab_size = runner.vocab_size
+        self.allocator = BlockAllocator(kv_budget_tokens // block_size + 1, block_size)
+        self._BlockTable = BlockTable
+        self._torch = torch
+        self.history: Dict[int, List[int]] = {}      # id(handle) -> prompt + generated so far
+        self.prefills = 0
+        self.decode_calls: List[int] = []           # active count per decode call
+
+    @property
+    def budget_tokens(self) -> int:
+        return self.allocator.num_usable * self.block_size
+
+    @property
+    def kv_bytes_per_token(self) -> int:
+        return self.runner.kv_bytes_per_token
+
+    @property
+    def cache_bytes(self) -> int:
+        return self.kv_bytes_per_token * self.allocator.num_blocks * self.block_size
+
+    def fits(self, prompt_len: int, max_new_tokens: int) -> bool:
+        total = prompt_len + max_new_tokens
+        return total <= self.max_seq_len and self.allocator.blocks_needed(total) <= self.allocator.num_usable
+
+    def can_admit(self, prompt_len: int, max_new_tokens: int) -> bool:
+        return self.fits(prompt_len, max_new_tokens) and \
+            self.allocator.blocks_needed(prompt_len + max_new_tokens) <= self.allocator.num_free
+
+    def admit(self, prompt_len: int, max_new_tokens: int):
+        if not self.can_admit(prompt_len, max_new_tokens):
+            raise RuntimeError("admit() called without can_admit()")
+        return self._BlockTable(self.allocator.allocate(self.allocator.blocks_needed(prompt_len + max_new_tokens)),
+                                self.block_size)
+
+    def free(self, handle) -> None:
+        self.allocator.free(handle.blocks)
+        handle.blocks = []
+        self.history.pop(id(handle), None)
+
+    def allocated_tokens(self, handles) -> int:
+        return sum(h.capacity for h in handles)
+
+    def _logits_for(self, token: int):
+        logits = self._torch.full((self.vocab_size,), -1.0)
+        logits[token] = 1.0
+        return logits
+
+    def prefill(self, handle, token_ids: Sequence[int]):
+        if len(token_ids) > handle.capacity:
+            raise ValueError("prompt exceeds block table capacity")
+        if self.runner.prefill_cost_per_token:
+            time.sleep(self.runner.prefill_cost_per_token * len(token_ids))
+        self.prefills += 1
+        self.history[id(handle)] = list(token_ids)
+        handle.fake_prompt_len = len(token_ids)
+        return self._logits_for(self.runner.next_token(list(token_ids), [])).unsqueeze(0)
+
+    def decode(self, handles, tokens: Sequence[int], positions: Sequence[int]):
+        if self.runner.decode_cost_per_token:
+            time.sleep(self.runner.decode_cost_per_token)
+        self.decode_calls.append(len(handles))
+        rows = []
+        for h, tok, pos in zip(handles, tokens, positions):
+            hist = self.history[id(h)]
+            assert pos == len(hist), "position must equal tokens stored for the sequence"
+            assert pos < h.capacity, "sequence outgrew its block table"
+            hist.append(tok)
+            plen = h.fake_prompt_len
+            rows.append(self._logits_for(self.runner.next_token(hist[:plen], hist[plen:])))
+        return self._torch.stack(rows)
+
+    def stats(self) -> Dict[str, object]:
+        return {
+            "block_size": self.block_size,
+            "num_blocks": self.allocator.num_usable,
+            "free_blocks": self.allocator.num_free,
+            "block_allocations": self.allocator.allocations,
+            "block_frees": self.allocator.frees,
+        }

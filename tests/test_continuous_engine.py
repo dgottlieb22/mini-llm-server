@@ -97,7 +97,7 @@ async def test_cancelled_while_queued_is_skipped():
 async def test_admission_control_rejects_what_cannot_fit():
     engine = ContinuousBatchEngine(FakeModelRunner(), max_slots=2, max_seq_len=16)
     await engine.start()
-    with pytest.raises(ValueError, match="exceeds max_seq_len"):
+    with pytest.raises(ValueError, match="cannot fit"):
         await engine.generate(GenerationRequest("big", [1] * 10, 7))
     ok = await engine.generate(GenerationRequest("fits", [1] * 10, 6))
     await engine.stop()
@@ -124,9 +124,11 @@ def test_stats_and_kv_accounting():
     assert s["served"] == 4 and s["prefill_count"] == 4 and s["prefill_tokens"] == 20
     assert s["kv_budget_tokens"] == 64 and s["kv_cache_bytes"] == 100 * 64
     # two sequences of 5 prompt + up to 3 cached output tokens each
-    assert 10 <= s["kv_peak_used_tokens"] <= 16
+    assert 10 <= s["kv_peak_resident_tokens"] <= 16
+    assert s["kv_peak_allocated_tokens"] == 64  # two whole slots of 32
     assert 0 < s["slot_utilization"] <= 1.0
     assert s["decode_steps"] >= 3
+    assert s["admission_waits"] >= 1  # 4 requests, 2 slots: someone waited
 
 
 def test_warmup_fills_every_slot_and_resets_stats():

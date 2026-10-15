@@ -203,4 +203,16 @@ WORKLOADS: Dict[str, WorkloadSpec] = {
         arrival="poisson", rate=1.0,
         description="Heterogeneous lengths (prompt 16-512, output 8-256), Poisson at 1 req/s.",
     ),
+    # Added at stage 4: loads that saturate 8 concurrent sequences, so an
+    # allocator that fits more sequences into the same KV budget can show it.
+    "uniform_8x": WorkloadSpec(
+        name="uniform_8x", num_requests=64, prompt_len=_fixed(128), gen_len=_fixed(64),
+        arrival="poisson", rate=8.0,
+        description="Homogeneous requests (128 in, 64 out), Poisson arrivals at 8 req/s, 64 requests.",
+    ),
+    "hetero_4x": WorkloadSpec(
+        name="hetero_4x", num_requests=64, prompt_len=_uniform(16, 512), gen_len=_uniform(8, 256),
+        arrival="poisson", rate=4.0,
+        description="Heterogeneous lengths (prompt 16-512, output 8-256), Poisson at 4 req/s, 64 requests.",
+    ),
 }
