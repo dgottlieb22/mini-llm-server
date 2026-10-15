@@ -19,6 +19,7 @@ result file or a probe whose raw output is committed next to it.
 | 0 | `naive` | one request at a time, whole request to `generate()` | [notes/stage0.md](notes/stage0.md) |
 | 1 | `async_serial` | async intake + FIFO queue; model still serial on a worker thread. Predicted and measured: no change | [notes/stage1.md](notes/stage1.md) |
 | 2 | `static_batch` | take up to B queued requests, pad, one `generate()` per batch. 11x throughput on offline/closed-loop; 42% of decode slots wasted on heterogeneous lengths | [notes/stage2.md](notes/stage2.md) |
+| 3 | `continuous` | our own GPT-2 forward over an explicit slot KV cache; admit and retire sequences at every decode step. Queue wait on hetero_hi 3.0 s to 8 ms; KV reservation 70-93% empty at peak | [notes/stage3.md](notes/stage3.md) |
 
 Everything so far ran on a CPU-only host (AMD EPYC 9R14, 64 cores) with
 GPT-2 small in fp32. GPU utilization and GPU memory are recorded as "not
@@ -32,11 +33,13 @@ growth) exist on both; the per-step numbers do not transfer.
 miniserve/
   request.py            GenerationRequest / GenerationResult / RequestRecord
   model.py              HFModelRunner (generate() + per-token timestamps), FakeModelRunner
+  gpt2.py               our own GPT-2 forward over a slot-indexed KV cache (stage 3+)
   engines/
     base.py             the Engine interface every stage implements
     naive.py            stage 0
     async_serial.py     stage 1
     static_batch.py     stage 2
+    continuous.py       stage 3
   bench/
     workload.py         WorkloadSpec, length distributions, arrival processes, presets
     harness.py          asyncio load generator; replays a workload against any engine (with warm-up)
