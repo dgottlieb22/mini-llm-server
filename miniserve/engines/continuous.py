@@ -58,11 +58,18 @@ class ContinuousBatchEngine:
     name = "continuous"
     stage = 3
 
-    def __init__(self, runner: ModelRunner, max_slots: int = 8, max_seq_len: int = 1024) -> None:
+    def __init__(self, runner: ModelRunner, max_slots: int = 8, max_seq_len: int = 1024,
+                 max_live_tokens: Optional[int] = None) -> None:
         if max_slots < 1 or max_seq_len < 2:
             raise ValueError("need max_slots >= 1 and max_seq_len >= 2")
+        if max_live_tokens is not None and max_live_tokens < max_seq_len:
+            raise ValueError("max_live_tokens must be at least max_seq_len or no request could run")
         self.runner = runner
         self.max_slots, self.max_seq_len = max_slots, max_seq_len
+        # Bound on tokens resident across running sequences. Memory is what
+        # the core's can_admit() checks; this bounds the work of a decode step,
+        # which reads every resident token's K/V. None = memory only.
+        self.max_live_tokens = max_live_tokens
         self.core = self._make_core()
         self._pending: Deque[_QueueItem] = deque()
         self._running: Dict[str, _Seq] = {}   # by request id, in admission order
@@ -186,7 +193,8 @@ class ContinuousBatchEngine:
                 self._reject(request, fut, f"prompt {request.prompt_len} + output {request.max_new_tokens} "
                                            f"cannot fit in the cache")
                 continue
-            if not self.core.can_admit(request.prompt_len, request.max_new_tokens):
+            if not self.core.can_admit(request.prompt_len, request.max_new_tokens) or \
+                    not self._within_live_budget(request):
                 self._admission_waits += 1
                 break
             self._pending.popleft()
@@ -212,6 +220,18 @@ class ContinuousBatchEngine:
 
     def _stopped_on_eos(self, seq: _Seq, tok: int) -> bool:
         return (not seq.request.force_length) and tok == self.core.eos_token_id
+
+    def _within_live_budget(self, request: GenerationRequest) -> bool:
+        """Would admitting this request keep resident tokens under max_live_tokens?
+
+        Counts what is resident now plus the new prompt. Running sequences
+        keep growing by one token per step, so this is a soft bound on the
+        step's work, not a hard one; an empty engine always admits.
+        """
+        if self.max_live_tokens is None or not self._running:
+            return True
+        resident = sum(s.cache_len + 1 for s in self._running.values())
+        return resident + request.prompt_len <= self.max_live_tokens
 
     async def _step(self) -> None:
         """One decode step over every active sequence."""
@@ -306,6 +326,9 @@ class ContinuousBatchEngine:
             "kv_peak_resident_tokens": self._kv_peak_resident_tokens,
             "kv_peak_allocated_tokens": self._kv_peak_allocated_tokens,
             "kv_cache_bytes": self.core.cache_bytes,
+            "max_live_tokens": self.max_live_tokens,
+            "attn_positions_computed": getattr(self.core, "attn_positions_computed", None),
+            "attn_positions_live": getattr(self.core, "attn_positions_live", None),
         }
         s.update(self._extra_stats())
         return s

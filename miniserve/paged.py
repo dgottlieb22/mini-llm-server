@@ -201,6 +201,8 @@ class PagedGPT2Core(GPT2Core):
                                       dtype=torch.long, device=self.device)
         write_off = pos % self.block_size
         T = max_nb * self.block_size
+        self.attn_positions_computed += B * T
+        self.attn_positions_live += sum(int(p) + 1 for p in positions)
         mask = (torch.arange(T, device=self.device)[None, :] <= pos[:, None]).view(B, 1, 1, T)
         x = (self.wte[tok] + self.wpe[pos]).unsqueeze(1)  # [B, 1, d]
         for layer, L in enumerate(self.layers):
@@ -221,4 +223,6 @@ class PagedGPT2Core(GPT2Core):
             "free_blocks": self.allocator.num_free,
             "block_allocations": self.allocator.allocations,
             "block_frees": self.allocator.frees,
+            "attn_positions_computed": self.attn_positions_computed,
+            "attn_positions_live": self.attn_positions_live,
         }

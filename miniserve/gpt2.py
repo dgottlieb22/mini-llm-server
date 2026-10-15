@@ -70,6 +70,10 @@ class GPT2Core:
         self.v_cache = torch.zeros(shape, dtype=self.dtype, device=self.device)
         self._all_slots = torch.arange(max_slots, device=self.device)
         self._free_slots: List[int] = list(range(max_slots - 1, -1, -1))
+        # Attention work accounting: positions attended over (padded to the
+        # longest sequence in the batch) versus positions that hold a token.
+        self.attn_positions_computed = 0
+        self.attn_positions_live = 0
 
     # ---- allocation: one max_seq_len reservation per sequence --------------
 
@@ -166,6 +170,8 @@ class GPT2Core:
         if int(pos.max()) >= self.max_seq_len:
             raise ValueError("a sequence has outgrown max_seq_len")
         T = int(pos.max()) + 1
+        self.attn_positions_computed += S * T
+        self.attn_positions_live += sum(int(p) + 1 for p in positions)
         # key j is visible to slot s iff j <= pos[s]; idle slots see only key 0.
         mask = (torch.arange(T, device=self.device)[None, :] <= pos[:, None]).view(S, 1, 1, T)
         x = (self.wte[tok] + self.wpe[pos]).unsqueeze(1)  # [S, 1, d]

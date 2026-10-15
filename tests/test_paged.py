@@ -189,6 +189,33 @@ def test_fragmentation_stat_counts_reserved_but_empty():
     assert s["kv_peak_reserved_but_empty_tokens"] == 6
 
 
+def test_live_token_bound_limits_concurrency_even_with_free_blocks():
+    # 1024 tokens of blocks (plenty), but at most 40 live tokens: requests of
+    # 10 prompt + 10 output fit 3-4 at a time by tokens, 51 by blocks.
+    spec = _spec(num_requests=12, prompt_len=LengthSpec("fixed", value=10), gen_len=LengthSpec("fixed", value=10))
+    unbounded = PagedEngine(FakeModelRunner(decode_cost_per_token=0.001), kv_budget_tokens=1024, block_size=4,
+                            max_seq_len=64)
+    bounded = PagedEngine(FakeModelRunner(decode_cost_per_token=0.001), kv_budget_tokens=1024, block_size=4,
+                          max_seq_len=64, max_live_tokens=64)
+    asyncio.run(run_workload(unbounded, spec, warmup=False))
+    asyncio.run(run_workload(bounded, spec, warmup=False))
+    assert max(unbounded.core.decode_calls) == 12
+    assert max(bounded.core.decode_calls) <= 6
+    assert bounded.stats()["admission_waits"] >= 1
+    with pytest.raises(ValueError):
+        PagedEngine(FakeModelRunner(), kv_budget_tokens=1024, block_size=4, max_seq_len=64, max_live_tokens=32)
+
+
+def test_attention_accounting_on_the_real_core(tiny):
+    core = PagedGPT2Core(tiny, budget_tokens=64, block_size=4, max_seq_len=64)
+    ha, hb = core.admit(8, 2), core.admit(3, 2)
+    core.prefill(ha, list(range(1, 9)))
+    core.prefill(hb, [40, 41, 42])
+    core.decode([ha, hb], [11, 12], [8, 3])
+    # padded to 3 blocks (12 positions) for both: 24 computed; live 9 + 4 = 13
+    assert core.attn_positions_computed == 24 and core.attn_positions_live == 13
+
+
 def test_invalid_config():
     with pytest.raises(ValueError):
         PagedEngine(FakeModelRunner(), kv_budget_tokens=2, block_size=4)
