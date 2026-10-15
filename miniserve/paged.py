@@ -124,6 +124,20 @@ class PagedGPT2Core(GPT2Core):
         self.k_cache = torch.zeros(shape, dtype=self.dtype, device=self.device)
         self.v_cache = torch.zeros(shape, dtype=self.dtype, device=self.device)
         del self._free_slots, self._all_slots
+        # Reusable destination for the per-step gather. A fresh tensor per
+        # call is page-faulted by the allocator once it passes about 32 MB
+        # (glibc's mmap threshold; jemalloc's cliff is lower), which turned a
+        # 90 us gather into 5 ms: scripts/probe_gather_kernels.py.
+        self._gather_rows = 0
+        self._gk = self._gv = None
+
+    def _gather_buffers(self, rows: int):
+        if rows > self._gather_rows:
+            shape = (rows, self.block_size, self.n_head, self.head_dim)
+            self._gk = torch.empty(shape, dtype=self.dtype, device=self.device)
+            self._gv = torch.empty(shape, dtype=self.dtype, device=self.device)
+            self._gather_rows = rows
+        return self._gk[:rows], self._gv[:rows]
 
     # ---- allocation ------------------------------------------------------
 
@@ -205,14 +219,17 @@ class PagedGPT2Core(GPT2Core):
         self.attn_positions_live += sum(int(p) + 1 for p in positions)
         mask = (torch.arange(T, device=self.device)[None, :] <= pos[:, None]).view(B, 1, 1, T)
         x = (self.wte[tok] + self.wpe[pos]).unsqueeze(1)  # [B, 1, d]
+        gk, gv = self._gather_buffers(B * max_nb)
         for layer, L in enumerate(self.layers):
             q, k, v = self._qkv(self._ln(x, L["ln1_w"], L["ln1_b"]), L)  # [B, H, 1, hd]
             self.k_cache[layer][write_block, write_off] = k[:, :, 0]
             self.v_cache[layer][write_block, write_off] = v[:, :, 0]
-            # The gather: one copy of the batch's live KV per layer, then a free view.
-            K = self.k_cache[layer][flat_table].view(B, T, self.n_head, self.head_dim)
-            V = self.v_cache[layer][flat_table].view(B, T, self.n_head, self.head_dim)
-            att = F.scaled_dot_product_attention(q, K.transpose(1, 2), V.transpose(1, 2), attn_mask=mask)
+            # The gather: one copy of the batch's live KV per layer into a reused buffer, then free views.
+            torch.index_select(self.k_cache[layer], 0, flat_table, out=gk)
+            torch.index_select(self.v_cache[layer], 0, flat_table, out=gv)
+            K = gk.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+            V = gv.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+            att = F.scaled_dot_product_attention(q, K, V, attn_mask=mask)
             x = self._finish_block(x, att, L)
         return self._logits(x[:, 0])
 
