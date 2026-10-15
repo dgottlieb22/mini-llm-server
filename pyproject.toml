@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-llm-server"
+version = "0.1.0"
+description = "A miniature LLM serving engine built up from naive model.generate(), one measured architectural change at a time."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.45",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+plots = ["matplotlib>=3.7"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+miniserve-bench = "miniserve.bench.run:main"
+
+[tool.setuptools.packages.find]
+include = ["miniserve*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "model: loads real model weights (slow, needs network or a cached model)",
+]

@@ -1,0 +1,10 @@
+# Pinned versions for a CPU-only development machine. Install with:
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements-cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu
+#   .venv/bin/pip install -e .
+torch==2.8.0+cpu
+transformers==4.57.1
+numpy==2.0.2
+matplotlib==3.9.4
+pytest==8.3.5
+pytest-asyncio==0.24.0

@@ -1,0 +1,23 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Raw benchmark output is machine-specific. Curated runs that the README and
+# the stage notes cite are committed under results/ explicitly with git add -f.
+/results/raw/
+
+# Model weights
+/models/
+
+# Editor
+.vscode/
+.idea/
+*.swp
