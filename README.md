@@ -21,6 +21,7 @@ result file or a probe whose raw output is committed next to it.
 | 2 | `static_batch` | take up to B queued requests, pad, one `generate()` per batch. 11x throughput on offline/closed-loop; 42% of decode slots wasted on heterogeneous lengths | [notes/stage2.md](notes/stage2.md) |
 | 3 | `continuous` | our own GPT-2 forward over an explicit slot KV cache; admit and retire sequences at every decode step. Queue wait on hetero_hi 3.0 s to 8 ms; KV reservation 70-93% empty at peak | [notes/stage3.md](notes/stage3.md) |
 | 4 | `paged` | block allocator + block tables, gather per step. Same 8192-token budget holds 2-4x the sequences: 12.0 vs 6.1 req/s offline, uniform_8x TTFT p99 2.3 s to 114 ms; loses on long contexts, where the gather doubles KV traffic | [notes/stage4.md](notes/stage4.md) |
+| 5 | `paged --engine-kw prefill_batch_tokens=4096` | co-arriving requests prefill in one padded forward. closed8/burst TTFT p99 300 to 106/125 ms; offline 12.0 to 15.5 req/s | [notes/stage5.md](notes/stage5.md) |
 
 Everything so far ran on a CPU-only host (AMD EPYC 9R14, 64 cores) with
 GPT-2 small in fp32. GPU utilization and GPU memory are recorded as "not
