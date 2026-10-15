@@ -78,6 +78,12 @@ class HFModelRunner:
         elem = torch.tensor([], dtype=self.dtype).element_size()
         return n_layers * 2 * n_kv_heads * head_dim * elem
 
+    def make_core(self, max_slots: int, max_seq_len: int):
+        """The step-level model (prefill / decode over a slot cache) for stage 3+."""
+        from .gpt2 import GPT2Core
+
+        return GPT2Core(self.model, max_slots=max_slots, max_seq_len=max_seq_len)
+
     def generate_one(self, request: GenerationRequest) -> GenerationResult:
         import torch
 
@@ -269,3 +275,66 @@ class FakeModelRunner:
             )
             for i, r in enumerate(requests)
         ]
+
+    def make_core(self, max_slots: int, max_seq_len: int) -> "FakeCore":
+        return FakeCore(self, max_slots, max_seq_len)
+
+
+class FakeCore:
+    """Step-level stand-in for GPT2Core, producing FakeModelRunner's tokens.
+
+    It keeps the token history per slot (the real core keeps K/V per slot)
+    so engine tests can check slot reuse, admission and cancellation without
+    weights. decode costs decode_cost_per_token once per step regardless of
+    how many slots are active, like the real core; prefill costs
+    prefill_cost_per_token per prompt token.
+    """
+
+    def __init__(self, runner: FakeModelRunner, max_slots: int, max_seq_len: int) -> None:
+        import torch
+
+        self.runner = runner
+        self.max_slots, self.max_seq_len = max_slots, max_seq_len
+        self.eos_token_id = runner.eos_token_id
+        self.vocab_size = runner.vocab_size
+        self.slots: List[Optional[List[int]]] = [None] * max_slots   # prompt ids per slot
+        self.generated: List[List[int]] = [[] for _ in range(max_slots)]
+        self.prefills: List[int] = []            # slot per prefill call
+        self.decode_calls: List[List[int]] = []  # active slots per decode call
+        self._torch = torch
+
+    @property
+    def kv_bytes_per_token(self) -> int:
+        return self.runner.kv_bytes_per_token
+
+    @property
+    def cache_bytes(self) -> int:
+        return self.kv_bytes_per_token * self.max_slots * self.max_seq_len
+
+    def _logits_for(self, token: int):
+        logits = self._torch.full((self.vocab_size,), -1.0)
+        logits[token] = 1.0
+        return logits
+
+    def prefill(self, slot: int, token_ids: Sequence[int]):
+        if len(token_ids) > self.max_seq_len:
+            raise ValueError("prompt too long")
+        if self.runner.prefill_cost_per_token:
+            time.sleep(self.runner.prefill_cost_per_token * len(token_ids))
+        self.prefills.append(slot)
+        self.slots[slot] = list(token_ids)
+        self.generated[slot] = []
+        return self._logits_for(self.runner.next_token(list(token_ids), [])).unsqueeze(0)
+
+    def decode(self, slots: Sequence[int], tokens: Sequence[int], positions: Sequence[int]):
+        if self.runner.decode_cost_per_token:
+            time.sleep(self.runner.decode_cost_per_token)
+        self.decode_calls.append(list(slots))
+        rows = []
+        for s, tok, pos in zip(slots, tokens, positions):
+            prompt = self.slots[s]
+            assert prompt is not None, f"decode on empty slot {s}"
+            assert pos == len(prompt) + len(self.generated[s]), "position must equal tokens in the slot"
+            self.generated[s].append(tok)
+            rows.append(self._logits_for(self.runner.next_token(prompt, self.generated[s])))
+        return self._torch.stack(rows)
