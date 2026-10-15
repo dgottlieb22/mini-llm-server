@@ -1,17 +1,12 @@
 import asyncio
 
-import pytest
 import torch
 
 from conftest import hf_logits
 from miniserve.bench.harness import run_workload
 from miniserve.bench.workload import LengthSpec, WorkloadSpec
 from miniserve.engines.prefix_cached import PrefixCachedEngine
-from miniserve.model import HFModelRunner
 from miniserve.prefix_cache import PrefixCachedGPT2Core
-from miniserve.request import GenerationRequest
-
-
 
 
 PREFIX = list(range(1, 13))          # 12 tokens = 3 full blocks of 4

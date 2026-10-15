@@ -73,12 +73,12 @@ def main() -> None:
             t = time.perf_counter()
             logits = ex.submit(core.decode, slots, [7] * S, [args.context] * S).result()
             xs.append((time.perf_counter() - t) * 1000)
-            picks = logits.clone().argmax(dim=-1).tolist()  # main thread
+            logits.clone().argmax(dim=-1).tolist()  # main thread
         print(f"  step {statistics.median(xs[3:]):6.2f} ms (measured around the worker call only)")
         xs = []
         for i in range(args.repeats):
             t = time.perf_counter()
-            picks = ex.submit(lambda: core.decode(slots, [7] * S, [args.context] * S).argmax(dim=-1).tolist()).result()
+            ex.submit(lambda: core.decode(slots, [7] * S, [args.context] * S).argmax(dim=-1).tolist()).result()
             xs.append((time.perf_counter() - t) * 1000)
         print(f"  step {statistics.median(xs[3:]):6.2f} ms when argmax runs on the worker thread too")
     for var in ("OMP_NUM_THREADS", "KMP_BLOCKTIME", "GOMP_SPINCOUNT", "OMP_WAIT_POLICY"):

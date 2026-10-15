@@ -11,9 +11,6 @@ from miniserve.engines.paged import PagedEngine
 from miniserve.gpt2 import GPT2Core
 from miniserve.model import FakeModelRunner
 from miniserve.paged import PagedGPT2Core
-from miniserve.request import GenerationRequest
-
-
 
 
 PROMPTS = [[1, 2, 3, 4, 5, 6, 7, 8, 9], [40, 41, 42], [60, 61, 62, 63, 64, 65]]

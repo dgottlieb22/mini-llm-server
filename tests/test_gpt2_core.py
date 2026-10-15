@@ -5,8 +5,6 @@ from conftest import hf_logits
 from miniserve.gpt2 import GPT2Core, argmax_tokens
 
 
-
-
 def test_prefill_matches_hf_last_position(tiny):
     core = GPT2Core(tiny, max_slots=2, max_seq_len=64)
     ids = [5, 17, 3, 44, 9, 60, 2]

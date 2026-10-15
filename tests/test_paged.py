@@ -38,7 +38,6 @@ def test_block_table_addressing():
 # ---- paged core against HF ---------------------------------------------------
 
 
-
 def test_paged_core_matches_hf_across_block_boundaries(tiny):
     core = PagedGPT2Core(tiny, budget_tokens=64, block_size=4, max_seq_len=64)
     a = [1, 2, 3, 4, 5, 6, 7, 8, 9]   # 9 tokens: 3 blocks, last one partial
